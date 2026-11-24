@@ -1,4 +1,4 @@
-# Prince of Persia (2008) — Android ARM64 Port (ReXGlue)
+# Prince of Persia (2008) — Android ARM64 Port
 
 Android ARM64 port wrapper, custom touch controls, and Vulkan/Adreno performance patches for **Prince of Persia (2008)** built on top of the ReXGlue static recompilation runtime.
 
