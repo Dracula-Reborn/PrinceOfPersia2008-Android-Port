@@ -1,0 +1,2681 @@
+diff --git a/cmake/rexglue_target.cmake b/cmake/rexglue_target.cmake
+index 3ebd7b9d..d307632c 100644
+--- a/cmake/rexglue_target.cmake
++++ b/cmake/rexglue_target.cmake
+@@ -118,7 +118,7 @@ function (rexglue_cpu_flags out_var)
+     AND NOT APPLE
+     AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64"
+   )
+-    list(APPEND flags -march=armv8-a)
++    list(APPEND flags -march=armv8.4-a+lse+rcpc+dotprod -fno-stack-protector)
+   endif ()
+   if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+     list(APPEND flags -msse4.1)
+diff --git a/include/rex/app/app.h b/include/rex/app/app.h
+index 0bf7913a..00b9dee9 100644
+--- a/include/rex/app/app.h
++++ b/include/rex/app/app.h
+@@ -385,6 +385,13 @@ REX_APP_API CLIArgList GetWindowsCommandLine();
+     return ::rex::app::detail::RunGuarded(                               \
+         [&] { return fn(::rex::CLIArgList::Parse(argc, argv)); });       \
+   }
++#elif defined(__ANDROID__)
++#define REX_DETAIL_ENTRY_POINTS(fn)                                \
++  extern "C" __attribute__((visibility("default")))                \
++  int SDL_main(int argc, char** argv) {                            \
++    return ::rex::app::detail::RunGuarded(                         \
++        [&] { return fn(::rex::CLIArgList::Parse(argc, argv)); }); \
++  }
+ #else
+ #define REX_DETAIL_ENTRY_POINTS(fn)                                \
+   int main(int argc, char** argv) {                                \
+diff --git a/include/rex/platform/native_window.h b/include/rex/platform/native_window.h
+index c30344ab..843e581d 100644
+--- a/include/rex/platform/native_window.h
++++ b/include/rex/platform/native_window.h
+@@ -21,6 +21,7 @@ struct NativeWindow {
+     kCocoa,   /**< window is an NSWindow pointer and layer a CAMetalLayer pointer. */
+     kWayland, /**< window is a wl_surface pointer and display a wl_display pointer. */
+     kX11,     /**< window is an X11 Window id stored as an integer and display a Display pointer. */
++    kAndroid, /**< window is an ANativeWindow pointer. */
+   };
+   Type type = Type::kNone;
+   void* window = nullptr;
+diff --git a/src/apu/sdl3/sdl3_audio_driver.cpp b/src/apu/sdl3/sdl3_audio_driver.cpp
+index 966bb154..861e848e 100644
+--- a/src/apu/sdl3/sdl3_audio_driver.cpp
++++ b/src/apu/sdl3/sdl3_audio_driver.cpp
+@@ -1,3 +1,9 @@
++#if defined(__ANDROID__)
++// REX_POP_AUDIO_TOP_INCLUDES
++#include <cstdint>
++#include <cstring>
++#include <dlfcn.h>
++#endif
+ #include "apu/sdl3/sdl3_audio_driver.h"
+ 
+ #include <algorithm>
+@@ -62,6 +68,10 @@ void SDL3AudioDriver::Shutdown() {
+ }
+ 
+ Result<u32> SDL3AudioDriver::OpenDevice(u32 channels, AudioFill fill) {
++#if defined(__ANDROID__)
++  // Force stereo downmix on Android so 5.1 center-channel dialogue is not dropped
++  channels = 2;
++#endif
+   CloseDevice();
+   fill_ = std::move(fill);
+   SDL_AudioSpec spec = {};
+@@ -110,6 +120,31 @@ bool SDL3AudioDriver::IsDeviceLost() const {
+   return stream_ && SDL_GetAudioStreamDevice(stream_) == 0;
+ }
+ 
++#if defined(__ANDROID__)
++// REX_POP_AUDIO_BOOT_MUTE
++
++namespace rex_pop_audio {
++inline bool IsBootMuted() {
++  static bool g_unmuted = false;
++  if (g_unmuted) return false;
++  using PfnReady = int32_t (*)();
++  static PfnReady g_fn = nullptr;
++  static bool g_looked_up = false;
++  if (!g_looked_up) {
++    void* h = ::dlopen("libtouchpad.so", RTLD_NOLOAD);
++    if (h) g_fn = reinterpret_cast<PfnReady>(::dlsym(h, "rex_touchpad_is_boot_ready"));
++    if (!g_fn) g_fn = reinterpret_cast<PfnReady>(::dlsym(RTLD_DEFAULT, "rex_touchpad_is_boot_ready"));
++    if (g_fn) g_looked_up = true;
++  }
++  if (!g_fn) return false;
++  if (g_fn() != 0) {
++    g_unmuted = true;
++    return false;
++  }
++  return true;
++}
++}  // namespace rex_pop_audio
++#endif
+ void SDL3AudioDriver::Pull(SDL_AudioStream* stream, int additional_amount) {
+   const u32 samples = static_cast<u32>(std::max(additional_amount, 0)) / sizeof(f32);
+   const u32 count = samples - samples % channels_;
+@@ -118,6 +153,11 @@ void SDL3AudioDriver::Pull(SDL_AudioStream* stream, int additional_amount) {
+   }
+   scratch_.resize(count);
+   fill_(std::span<f32>(scratch_.data(), count), channels_);
++#if defined(__ANDROID__)
++  if (rex_pop_audio::IsBootMuted()) {
++    std::memset(scratch_.data(), 0, count * sizeof(f32));
++  }
++#endif
+   SDL_PutAudioStreamData(stream, scratch_.data(), static_cast<int>(count * sizeof(f32)));
+ }
+ 
+diff --git a/src/base/CMakeLists.txt b/src/base/CMakeLists.txt
+index ada2fcf4..97aa7982 100644
+--- a/src/base/CMakeLists.txt
++++ b/src/base/CMakeLists.txt
+@@ -157,6 +157,8 @@ target_include_directories(
+ 
+ if (APPLE)
+   target_link_libraries(rexbase PRIVATE pthread)
++elseif (ANDROID)
++  target_link_libraries(rexbase PRIVATE dl log)
+ elseif (UNIX)
+   target_link_libraries(rexbase PRIVATE pthread rt dl)
+ endif ()
+diff --git a/src/base/crash_posix.cpp b/src/base/crash_posix.cpp
+index 51824a1e..7addeaf5 100644
+--- a/src/base/crash_posix.cpp
++++ b/src/base/crash_posix.cpp
+@@ -20,7 +20,12 @@
+ #include <cstring>
+ #include <format>
+ 
++#if defined(__ANDROID__)
++#include <cstdint>
++#include <unwind.h>
++#else
+ #include <execinfo.h>
++#endif
+ #include <pthread.h>
+ #include <signal.h>
+ #include <sys/mman.h>
+@@ -355,6 +360,34 @@ std::string_view DescribeCode(u64 address, std::span<char> out) {
+   return {out.data(), std::min(static_cast<size_t>(result.size), out.size())};
+ }
+ 
++#if defined(__ANDROID__)
++struct AndroidBacktraceState {
++  void** current;
++  void** end;
++};
++
++_Unwind_Reason_Code AndroidUnwindCallback(struct _Unwind_Context* context, void* arg) {
++  auto* state = static_cast<AndroidBacktraceState*>(arg);
++  uintptr_t pc = _Unwind_GetIP(context);
++  if (pc != 0) {
++    if (state->current == state->end) {
++      return _URC_END_OF_STACK;
++    }
++    *state->current++ = reinterpret_cast<void*>(pc);
++  }
++  return _URC_NO_REASON;
++}
++
++void LogBacktrace() {
++  void* frames[kBacktraceFrames] = {};
++  AndroidBacktraceState state{frames, frames + kBacktraceFrames};
++  _Unwind_Backtrace(AndroidUnwindCallback, &state);
++  const auto count = static_cast<size_t>(state.current - frames);
++  for (size_t i = 0; i < count; ++i) {
++    WriteBacktraceFrame(static_cast<u32>(i), reinterpret_cast<u64>(frames[i]));
++  }
++}
++#else
+ void LogBacktrace() {
+   void* frames[kBacktraceFrames] = {};
+   const int count = backtrace(frames, kBacktraceFrames);
+@@ -362,10 +395,13 @@ void LogBacktrace() {
+     WriteBacktraceFrame(static_cast<u32>(i), reinterpret_cast<u64>(frames[i]));
+   }
+ }
++#endif
+ 
+ [[nodiscard]] Result<void> InstallPlatform() {
++#if !defined(__ANDROID__)
+   void* primed = nullptr;
+   backtrace(&primed, 1);
++#endif
+   for (size_t i = 0; i < kReporterSignals.size(); ++i) {
+     struct sigaction current{};
+     if (sigaction(kReporterSignals[i], nullptr, &current) != 0) {
+diff --git a/src/base/fiber_posix.cpp b/src/base/fiber_posix.cpp
+index 3d25ae20..e7ab4c2e 100644
+--- a/src/base/fiber_posix.cpp
++++ b/src/base/fiber_posix.cpp
+@@ -13,12 +13,70 @@
+ #endif
+ 
+ #include <cassert>
++#include <cstdint>
++#include <cstring>
+ #include <memory>
+ 
++#if defined(__ANDROID__) && defined(__aarch64__)
++extern "C" void rex_arm64_fiber_swap(void* from, const void* to);
++
++__asm__(
++    ".text\n"
++    ".p2align 4\n"
++    ".globl rex_arm64_fiber_swap\n"
++    ".hidden rex_arm64_fiber_swap\n"
++    ".type rex_arm64_fiber_swap, @function\n"
++    "rex_arm64_fiber_swap:\n"
++    "  stp x19, x20, [x0, #0]\n"
++    "  stp x21, x22, [x0, #16]\n"
++    "  stp x23, x24, [x0, #32]\n"
++    "  stp x25, x26, [x0, #48]\n"
++    "  stp x27, x28, [x0, #64]\n"
++    "  stp x29, x30, [x0, #80]\n"
++    "  mov x9, sp\n"
++    "  str x9, [x0, #96]\n"
++    "  stp d8, d9, [x0, #112]\n"
++    "  stp d10, d11, [x0, #128]\n"
++    "  stp d12, d13, [x0, #144]\n"
++    "  stp d14, d15, [x0, #160]\n"
++    "  ldp x19, x20, [x1, #0]\n"
++    "  ldp x21, x22, [x1, #16]\n"
++    "  ldp x23, x24, [x1, #32]\n"
++    "  ldp x25, x26, [x1, #48]\n"
++    "  ldp x27, x28, [x1, #64]\n"
++    "  ldp x29, x30, [x1, #80]\n"
++    "  ldr x9, [x1, #96]\n"
++    "  mov sp, x9\n"
++    "  ldp d8, d9, [x1, #112]\n"
++    "  ldp d10, d11, [x1, #128]\n"
++    "  ldp d12, d13, [x1, #144]\n"
++    "  ldp d14, d15, [x1, #160]\n"
++    "  ret\n"
++    ".size rex_arm64_fiber_swap, .-rex_arm64_fiber_swap\n");
++#endif
++
+ namespace rex::platform {
+ 
+ namespace {
+ thread_local Fiber* g_current_fiber = nullptr;
++
++#if defined(__ANDROID__) && defined(__aarch64__)
++struct Arm64FiberCtx {
++  uint64_t x19, x20;
++  uint64_t x21, x22;
++  uint64_t x23, x24;
++  uint64_t x25, x26;
++  uint64_t x27, x28;
++  uint64_t x29, x30;
++  uint64_t sp;
++  uint64_t pad;
++  uint64_t d8, d9;
++  uint64_t d10, d11;
++  uint64_t d12, d13;
++  uint64_t d14, d15;
++};
++static_assert(sizeof(Arm64FiberCtx) <= sizeof(ucontext_t));
++#endif
+ }  // namespace
+ 
+ Fiber* Fiber::GetCurrent() {
+@@ -27,9 +85,13 @@ Fiber* Fiber::GetCurrent() {
+ 
+ Fiber* Fiber::ConvertCurrentThread() {
+   auto f = std::make_unique<Fiber>();
++#if defined(__ANDROID__) && defined(__aarch64__)
++  std::memset(&f->context_, 0, sizeof(f->context_));
++#else
+   if (getcontext(&f->context_) == -1) {
+     return nullptr;
+   }
++#endif
+   f->is_thread_fiber_ = true;
+   g_current_fiber = f.get();
+   return f.release();
+@@ -41,6 +103,14 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
+   f->arg_ = arg;
+   f->stack_.resize(stack_size);
+ 
++#if defined(__ANDROID__) && defined(__aarch64__)
++  auto* ctx = reinterpret_cast<Arm64FiberCtx*>(&f->context_);
++  std::memset(ctx, 0, sizeof(Arm64FiberCtx));
++  uintptr_t stack_top = reinterpret_cast<uintptr_t>(f->stack_.data() + f->stack_.size());
++  stack_top &= ~uintptr_t{15};
++  ctx->sp = static_cast<uint64_t>(stack_top);
++  ctx->x30 = reinterpret_cast<uint64_t>(&Fiber::Trampoline);
++#else
+   if (getcontext(&f->context_) == -1) {
+     return nullptr;
+   }
+@@ -48,6 +118,7 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
+   f->context_.uc_stack.ss_size = f->stack_.size();
+   f->context_.uc_link = nullptr;
+   makecontext(&f->context_, &Fiber::Trampoline, 0);
++#endif
+   return f.release();
+ }
+ 
+@@ -59,7 +130,11 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
+ void Fiber::SwitchTo(Fiber* target) {
+   Fiber* from = g_current_fiber;
+   g_current_fiber = target;
++#if defined(__ANDROID__) && defined(__aarch64__)
++  rex_arm64_fiber_swap(&from->context_, &target->context_);
++#else
+   swapcontext(&from->context_, &target->context_);
++#endif
+ }
+ 
+ void Fiber::Destroy() {
+@@ -73,4 +148,4 @@ void Fiber::Destroy() {
+ 
+ }  // namespace rex::platform
+ 
+-#endif  // REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#endif  // REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+\ No newline at end of file
+diff --git a/src/base/host_alloc.cpp b/src/base/host_alloc.cpp
+index 3b9816e5..e3c20a3b 100644
+--- a/src/base/host_alloc.cpp
++++ b/src/base/host_alloc.cpp
+@@ -1,29 +1,19 @@
+-/**
+- * @file        base/host_alloc.cpp
+- *
+- * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
+- *              All rights reserved.
+- *
+- * @license     BSD 3-Clause License
+- *              See LICENSE file in the project root for full license text.
+- */
+-
+ #include <rex/memory/host.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <bit>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+-#include <algorithm>
+ #include <cstring>
+ #include <new>
+ 
+-#include <rex/platform/process.h>
+-#include <rex/platform/perf.h>
+ #include <rex/platform.h>
++#include <rex/platform/perf.h>
++#include <rex/platform/process.h>
+ 
+-#if REX_PLATFORM_WIN32
++#if REX_PLATFORM_WIN32 || defined(__ANDROID__)
+ #include <malloc.h>
+ #endif
+ 
+@@ -31,14 +21,16 @@ namespace rex::memory {
+ 
+ namespace {
+ 
++constexpr size_t kHeaderSize = 16;
++constexpr size_t kTagCount = kMaxTags;
++
++#if !defined(__ANDROID__)
+ #ifdef NDEBUG
+ constexpr bool kChecks = false;
+ #else
+ constexpr bool kChecks = true;
+ #endif
+ 
+-constexpr size_t kHeaderSize = 16;
+-constexpr size_t kTagCount = kMaxTags;
+ constexpr u32 kLiveMagic = 0xA110C8ED;
+ constexpr u32 kFreedMagic = 0xDEADF00D;
+ constexpr u8 kNewFill = 0xCD;
+@@ -53,6 +45,7 @@ struct Header {
+   u64 packed;
+ };
+ static_assert(sizeof(Header) == kHeaderSize);
++#endif
+ 
+ struct alignas(64) Counters {
+   std::atomic<u64> live_bytes{0};
+@@ -69,9 +62,6 @@ constinit std::atomic<i32> g_stack_depth{0};
+ constinit std::atomic<u32> g_fail_count{0};
+ constinit std::atomic<detail::BlockErrorHandler> g_error_handler{nullptr};
+ constinit thread_local Tag t_tag = Tag::kCore;
+-#ifdef REXGLUE_ENABLE_PROFILING
+-constinit thread_local bool t_reporting = false;
+-#endif
+ 
+ constexpr size_t kTagNameCapacity = 32;
+ 
+@@ -83,7 +73,10 @@ struct TagNameText {
+ constinit TagNameText g_tag_name_text[kTagCount]{};
+ constinit std::atomic<const char*> g_tag_names[kTagCount] = {{"Core"}, {"ThirdParty"}};
+ 
++#if !defined(__ANDROID__)
+ #ifdef REXGLUE_ENABLE_PROFILING
++constinit thread_local bool t_reporting = false;
++
+ const char* GetPoolName(Tag tag) noexcept {
+   const char* name = g_tag_names[static_cast<size_t>(tag)].load(std::memory_order_relaxed);
+   return name ? name : "Unnamed";
+@@ -117,7 +110,6 @@ void CountFree(Tag tag, u64 size) noexcept {
+ }
+ 
+ #ifdef REXGLUE_ENABLE_PROFILING
+-
+ bool ReportAlloc(const void* ptr, size_t size, Tag tag) noexcept {
+   if (t_reporting || !TracyIsStarted) {
+     return false;
+@@ -148,8 +140,8 @@ void ReportFree(const void* ptr, Tag tag) noexcept {
+   }
+   t_reporting = false;
+ }
+-
+ #endif
++#endif  // !defined(__ANDROID__)
+ 
+ void* BackendAlloc(size_t bytes, size_t align) noexcept {
+ #if REX_PLATFORM_WIN32
+@@ -163,6 +155,7 @@ void* BackendAlloc(size_t bytes, size_t align) noexcept {
+ #endif
+ }
+ 
++#if !defined(__ANDROID__)
+ void BackendFree(void* base, bool aligned) noexcept {
+ #if REX_PLATFORM_WIN32
+   if (aligned) {
+@@ -197,6 +190,7 @@ Header* HeaderOf(void* ptr) noexcept {
+   rex::platform::Break();
+   std::abort();
+ }
++#endif
+ 
+ void* AllocBlock(size_t size, size_t align, detail::AllocType type) noexcept {
+   if (g_fail_count.load(std::memory_order_relaxed) != 0 &&
+@@ -206,6 +200,10 @@ void* AllocBlock(size_t size, size_t align, detail::AllocType type) noexcept {
+   if (align != 0 && !std::has_single_bit(align)) {
+     return nullptr;
+   }
++#if defined(__ANDROID__)
++  (void)type;
++  return BackendAlloc(size != 0 ? size : 1, align);
++#else
+   const size_t effective = align > kHeaderSize ? align : kHeaderSize;
+   if (size > kSizeMask || size > SIZE_MAX - effective - kHeaderSize) {
+     return nullptr;
+@@ -231,6 +229,7 @@ void* AllocBlock(size_t size, size_t align, detail::AllocType type) noexcept {
+ #endif
+   CountAlloc(tag, size);
+   return user;
++#endif
+ }
+ 
+ }  // namespace
+@@ -245,8 +244,12 @@ void HostFree(void* ptr, size_t size, size_t align) noexcept {
+ }
+ 
+ size_t HostSize(const void* ptr) noexcept {
++#if defined(__ANDROID__)
++  return ptr ? malloc_usable_size(const_cast<void*>(ptr)) : 0;
++#else
+   const Header* header = reinterpret_cast<const Header*>(static_cast<const u8*>(ptr) - kHeaderSize);
+   return static_cast<size_t>(header->packed & kSizeMask);
++#endif
+ }
+ 
+ HostStats GetHostStats() noexcept {
+@@ -344,6 +347,12 @@ void DeleteBlock(void* ptr, size_t size, AllocType type) noexcept {
+   if (!ptr) {
+     return;
+   }
++#if defined(__ANDROID__)
++  (void)size;
++  (void)type;
++  std::free(ptr);
++  return;
++#else
+   Header* header = HeaderOf(ptr);
+   if constexpr (kChecks) {
+     if (reinterpret_cast<uintptr_t>(ptr) % kHeaderSize != 0 || header->magic != kLiveMagic) {
+@@ -374,8 +383,9 @@ void DeleteBlock(void* ptr, size_t size, AllocType type) noexcept {
+   }
+   CountFree(tag, block_size);
+   BackendFree(static_cast<u8*>(ptr) - offset, offset > kHeaderSize);
++#endif
+ }
+ 
+ }  // namespace detail
+ 
+-}  // namespace rex::memory
++}  // namespace rex::memory
+\ No newline at end of file
+diff --git a/src/base/memory_posix.cpp b/src/base/memory_posix.cpp
+index 1d7cd9f2..0d0b12dc 100644
+--- a/src/base/memory_posix.cpp
++++ b/src/base/memory_posix.cpp
+@@ -50,6 +50,8 @@
+ static_assert(sizeof(off_t) == 8);
+ 
+ #if REX_PLATFORM_ANDROID
++#include <android/api-level.h>
++#include <mutex>
+ #include <string.h>
+ 
+ #include <dlfcn.h>
+@@ -63,7 +65,7 @@ namespace rex {
+ namespace memory {
+ 
+ /** Builds a shm_open name from a path, hashing long names on macOS (31 character limit). */
+-static std::string BuildSHMName(const std::filesystem::path& path) {
++[[maybe_unused]] static std::string BuildSHMName(const std::filesystem::path& path) {
+   std::string name = path.string();
+   for (char& c : name) {
+     if (c == '/') {
+@@ -90,7 +92,7 @@ static void* libandroid_;
+ static int (*android_ASharedMemory_create_)(const char* name, size_t size);
+ 
+ void AndroidInitialize() {
+-  if (rex::GetAndroidAPILevel() >= 26) {
++  if (android_get_device_api_level() >= 26) {
+     libandroid_ = dlopen("libandroid.so", RTLD_NOW);
+     REX_ASSERT(libandroid_ != nullptr);
+     if (libandroid_) {
+@@ -334,8 +336,10 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+ }
+ 
+ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
+-                                          PageAccess access, [[maybe_unused]] bool commit) {
++                                          [[maybe_unused]] PageAccess access, [[maybe_unused]] bool commit) {
+ #if REX_PLATFORM_ANDROID
++  static std::once_flag android_shm_init;
++  std::call_once(android_shm_init, AndroidInitialize);
+   if (android_ASharedMemory_create_) {
+     int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
+     return sharedmem_fd >= 0 ? sharedmem_fd : kFileMappingHandleInvalid;
+@@ -414,7 +418,7 @@ void RemoveStaleFileMappings([[maybe_unused]] std::string_view prefix) {
+ #endif
+ }
+ 
+-void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
++void CloseFileMappingHandle(FileMappingHandle handle, [[maybe_unused]] const std::filesystem::path& path) {
+   close(handle);
+ #if !REX_PLATFORM_ANDROID
+   auto full_path = BuildSHMName(path);
+diff --git a/src/base/threading_posix.cpp b/src/base/threading_posix.cpp
+index a6af14ea..fd2bbfab 100644
+--- a/src/base/threading_posix.cpp
++++ b/src/base/threading_posix.cpp
+@@ -1,3 +1,6 @@
++#if defined(__ANDROID__)
++#include <sys/resource.h>
++#endif
+ /**
+  * @file        base/threading_posix.cpp
+  *
+@@ -68,9 +71,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <sched.h>
+ 
+ #if REX_PLATFORM_ANDROID
++#include <android/api-level.h>
+ #include <dlfcn.h>
+ 
+-#include <rex/main_android.h>
+ #include <rex/utility.h>
+ #endif
+ 
+@@ -124,7 +127,7 @@ static void* g_android_libc;
+ static int (*g_android_pthread_getname_np)(pthread_t pthread, char* buf, size_t n);
+ 
+ void AndroidInitialize() {
+-  if (rex::GetAndroidAPILevel() >= 26) {
++  if (android_get_device_api_level() >= 26) {
+     g_android_libc = dlopen("libc.so", RTLD_NOW);
+     REX_ASSERT(g_android_libc != nullptr);
+     if (g_android_libc) {
+@@ -426,7 +429,7 @@ class WaitRegistration : public NonCopyable {
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+     pthread_mutexattr_t attr;
+     if (pthread_mutexattr_init(&attr) == 0) {
+       if (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0) {
+@@ -543,7 +546,7 @@ class PosixConditionBase {
+ 
+  private:
+   bool Lock() {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+     const int result = pthread_mutex_lock(native_mutex);
+     if (result == EOWNERDEAD) {
+@@ -928,6 +931,15 @@ class PosixCondition<Timer> : public PosixConditionBase {
+ namespace {
+ 
+ void ApplyThreadPriority(pthread_t thread, int new_priority) {
++#if defined(__ANDROID__)
++  // REX_ANDROID_NICE_FIX: reset inherited NI=-20 so MIUI SystemUI / Recent Apps stay smooth
++  const pid_t tid = pthread_gettid_np(thread);
++  if (tid > 0) {
++    const int nice_val = new_priority > 0 ? -2 : 0;
++    setpriority(PRIO_PROCESS, static_cast<id_t>(tid), nice_val);
++  }
++  return;
++#endif
+   sched_param param{};
+   param.sched_priority = new_priority;
+   int result = pthread_setschedparam(thread, SCHED_FIFO, &param);
+@@ -988,6 +1000,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       pthread_attr_destroy(&attr);
+       return false;
+     }
++#if !defined(__ANDROID__)
++    // REX_ANDROID_SKIP_FIFO_ATTR
+     if (params.initial_priority != 0) {
+       sched_param sched{};
+       sched.sched_priority = params.initial_priority + 1;
+@@ -1000,6 +1014,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+         return false;
+       }
+     }
++#endif
+     ThreadStartData* const start = start_data.release();
+     if (pthread_create(&thread_, &attr, ThreadStartRoutine, start) != 0) {
+       start_data.reset(start);
+@@ -1058,8 +1073,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+           REX_ASSERT_ALWAYS();
+         }
+       } else {
+-        std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
+-        rex::copy_truncating(result.data(), android_pre_api_26_name_, result.size());
++        std::lock_guard<std::mutex> name_lock(android_pre_api_26_name_mutex_);
++        const size_t len = std::min(std::strlen(android_pre_api_26_name_), result.size() - 1);
++        std::memcpy(result.data(), android_pre_api_26_name_, len);
++        result[len] = '\0';
+       }
+ #else
+       if (pthread_getname_np(thread_, result.data(), result.size() - 1) != 0) {
+@@ -1093,8 +1110,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     if (g_android_pthread_getname_np) {
+       return;
+     }
+-    std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
+-    rex::copy_truncating(android_pre_api_26_name_, name, rex::CountOf(android_pre_api_26_name_));
++    std::lock_guard<std::mutex> name_lock(android_pre_api_26_name_mutex_);
++    const size_t len = std::min(name.size(), rex::CountOf(android_pre_api_26_name_) - 1);
++    std::memcpy(android_pre_api_26_name_, name.data(), len);
++    android_pre_api_26_name_[len] = '\0';
+   }
+ #endif
+ 
+@@ -1942,7 +1961,11 @@ class PosixThread : public PosixConditionHandle<Thread> {
+ 
+   void SetName(std::string name) override {
+     handle_.WaitStarted();
+-    Thread::SetName(name);
++    {
++      static std::mutex s_thread_name_mutex;
++      std::lock_guard<std::mutex> lock(s_thread_name_mutex);
++      Thread::SetName(name);
++    }
+     if (name.length() > 15) {
+       name = name.substr(0, 15);
+     }
+@@ -1991,6 +2014,10 @@ thread_local std::unique_ptr<PosixThread> g_owned_current_thread;
+ thread_local bool g_catches_exit = false;
+ 
+ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
++#if defined(__ANDROID__)
++  // REX_ANDROID_START_NICE_ZERO: drop inherited NI=-20 so MIUI UI stays responsive
++  setpriority(PRIO_PROCESS, 0, 0);
++#endif
+ #if !REX_PLATFORM_ANDROID
+   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
+     REX_ASSERT_ALWAYS();
+@@ -2092,8 +2119,8 @@ void SetCurrentThreadName(const std::string_view name) {
+   pthread_setname_np(pthread_self(), std::string(name).c_str());
+ #endif
+ #if REX_PLATFORM_ANDROID
+-  if (!g_android_pthread_getname_np && current_thread) {
+-    current_thread->GetCondition().SetAndroidPreAPI26Name(name);
++  if (!g_android_pthread_getname_np && g_current_thread) {
++    g_current_thread->GetCondition().SetAndroidPreAPI26Name(name);
+   }
+ #endif
+ }
+diff --git a/src/filesystem/host_file_posix.cpp b/src/filesystem/host_file_posix.cpp
+index 9a80b9a8..25777f88 100644
+--- a/src/filesystem/host_file_posix.cpp
++++ b/src/filesystem/host_file_posix.cpp
+@@ -54,7 +54,7 @@ int MoveReplace(const std::filesystem::path& from, const std::filesystem::path&
+ }
+ 
+ int MoveNoReplace(const std::filesystem::path& from, const std::filesystem::path& to) {
+-#if defined(__linux__)
++#if defined(__linux__) && (!defined(__ANDROID__) || __ANDROID_API__ >= 30)
+   if (renameat2(AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), RENAME_NOREPLACE) == 0) {
+     return 0;
+   }
+diff --git a/src/gpu/CMakeLists.txt b/src/gpu/CMakeLists.txt
+index ce26b833..7ba9a85a 100644
+--- a/src/gpu/CMakeLists.txt
++++ b/src/gpu/CMakeLists.txt
+@@ -16,7 +16,7 @@ target_include_directories(
+ )
+ rexglue_add_version_resource(rexgpu DESCRIPTION "ReXGlue graphics")
+ 
+-if (NOT WIN32 AND NOT APPLE)
++if (NOT WIN32 AND NOT APPLE AND NOT ANDROID)
+   find_package(PkgConfig REQUIRED)
+   pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+   pkg_check_modules(WAYLAND REQUIRED wayland-client)
+diff --git a/src/gpu/xenos/command_processor.cpp b/src/gpu/xenos/command_processor.cpp
+index 5e58c53d..9f6b2055 100644
+--- a/src/gpu/xenos/command_processor.cpp
++++ b/src/gpu/xenos/command_processor.cpp
+@@ -1,3 +1,28 @@
++#if defined(__ANDROID__)
++#include <atomic>
++#include <chrono>
++#include <sys/resource.h>
++// REX_CP_STALL_PERF
++extern std::atomic<int64_t> g_rex_cp_stall_us;
++extern std::atomic<uint64_t> g_rex_cp_stall_count;
++// REX_CP_PKT_BUCKETS
++extern std::atomic<int64_t> g_rex_cp_pb_us;
++extern std::atomic<uint64_t> g_rex_cp_pb_cnt;
++extern std::atomic<int64_t> g_rex_cp_draw_us;
++extern std::atomic<uint64_t> g_rex_cp_draw_cnt;
++extern std::atomic<int64_t> g_rex_cp_wrm_us;
++extern std::atomic<uint64_t> g_rex_cp_wrm_cnt;
++extern std::atomic<int64_t> g_rex_cp_pbend_us;
++std::atomic<int64_t> g_rex_cp_stall_us{0};
++std::atomic<uint64_t> g_rex_cp_stall_count{0};
++std::atomic<int64_t> g_rex_cp_pb_us{0};
++std::atomic<uint64_t> g_rex_cp_pb_cnt{0};
++std::atomic<int64_t> g_rex_cp_draw_us{0};
++std::atomic<uint64_t> g_rex_cp_draw_cnt{0};
++std::atomic<int64_t> g_rex_cp_wrm_us{0};
++std::atomic<uint64_t> g_rex_cp_wrm_cnt{0};
++std::atomic<int64_t> g_rex_cp_pbend_us{0};
++#endif
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -266,6 +291,9 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
+ }
+ 
+ void CommandProcessor::WorkerThreadMain() {
++#if defined(__ANDROID__)
++  setpriority(PRIO_PROCESS, 0, -4);
++#endif
+   if (!SetupContext()) {
+     REXGPU_FATAL("Unable to setup command processor internal state");
+   }
+@@ -277,6 +305,7 @@ void CommandProcessor::WorkerThreadMain() {
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+       REX_PROFILE_SCOPE_TEXT("gpu", "rex::gpu::CommandProcessor::Stall");
+       PrepareForWait();
++
+       do {
+         const int wait_time_ms = 5;
+         rex::platform::Wait(write_ptr_index_event_.get(), true,
+@@ -284,6 +313,7 @@ void CommandProcessor::WorkerThreadMain() {
+         write_ptr_index = write_ptr_index_.load();
+       } while (worker_running_ && !HasPendingFns() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
++
+       ReturnFromWait();
+       if (!worker_running_ || HasPendingFns()) {
+         continue;
+@@ -291,8 +321,10 @@ void CommandProcessor::WorkerThreadMain() {
+     }
+     REX_ASSERT(read_ptr_index_ != write_ptr_index);
+ 
++
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+ 
++
+     if (read_ptr_writeback_ptr_) {
+       StoreReleaseHost(physical_memory_, read_ptr_writeback_ptr_, read_ptr_index_);
+     }
+@@ -601,7 +633,17 @@ u32 CommandProcessor::ExecutePrimaryBuffer(u32 read_index, u32 write_index) {
+     }
+   } while (reader.GetReadCount());
+ 
++#if defined(__ANDROID__)
++  const auto rex_pbe_t0 = std::chrono::steady_clock::now();
++#endif
+   OnPrimaryBufferEnd();
++#if defined(__ANDROID__)
++  g_rex_cp_pbend_us.fetch_add(
++      std::chrono::duration_cast<std::chrono::microseconds>(
++          std::chrono::steady_clock::now() - rex_pbe_t0)
++          .count(),
++      std::memory_order_relaxed);
++#endif
+ 
+   return write_index;
+ }
+diff --git a/src/gpu/xenos/host/surface.cpp b/src/gpu/xenos/host/surface.cpp
+index e902a8aa..a604e88b 100644
+--- a/src/gpu/xenos/host/surface.cpp
++++ b/src/gpu/xenos/host/surface.cpp
+@@ -18,6 +18,8 @@ Surface::TypeIndex NativeSurface::GetType() const {
+       return kTypeIndexXCBWindow;
+     case NativeWindow::Type::kCocoa:
+       return kTypeIndexCAMetalLayer;
++    case NativeWindow::Type::kAndroid:
++      return kTypeIndexAndroidWindow;
+     default:
+       return kTypeIndexWin32HWND;
+   }
+diff --git a/src/gpu/xenos/host/surface.h b/src/gpu/xenos/host/surface.h
+index 00cbec2f..84847876 100644
+--- a/src/gpu/xenos/host/surface.h
++++ b/src/gpu/xenos/host/surface.h
+@@ -36,6 +36,7 @@ class Surface : public rex::NonCopyable {
+     kTypeIndexXCBWindow,
+     kTypeIndexWin32HWND,
+     kTypeIndexCAMetalLayer, /**< Presented via MoltenVK with VK_EXT_metal_surface. */
++    kTypeIndexAndroidWindow,
+   };
+   /** Bit mask of `TypeIndex` values, 1 bit per surface type. */
+   using TypeFlags = u32;
+@@ -44,6 +45,7 @@ class Surface : public rex::NonCopyable {
+     kTypeFlagXCBWindow = static_cast<TypeFlags>(1) << kTypeIndexXCBWindow,
+     kTypeFlagWin32HWND = static_cast<TypeFlags>(1) << kTypeIndexWin32HWND,
+     kTypeFlagCAMetalLayer = static_cast<TypeFlags>(1) << kTypeIndexCAMetalLayer,
++    kTypeFlagAndroidWindow = static_cast<TypeFlags>(1) << kTypeIndexAndroidWindow,
+   };
+ 
+   virtual ~Surface() = default;
+diff --git a/src/gpu/xenos/host/vulkan/vulkan_device.cpp b/src/gpu/xenos/host/vulkan/vulkan_device.cpp
+index aae5dc38..5b918e64 100644
+--- a/src/gpu/xenos/host/vulkan/vulkan_device.cpp
++++ b/src/gpu/xenos/host/vulkan/vulkan_device.cpp
+@@ -415,9 +415,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     device->queue_family_sparse_binding_ = first_queue_family_sparse_binding;
+   }
+ 
++  // REX_ANDROID_DUAL_QUEUE: allocate a 2nd queue for vkQueuePresentKHR if supported
++  const size_t rex_wanted_queues = std::min<size_t>(
++      2, static_cast<size_t>(queue_families[device->queue_family_graphics_compute_].queueCount));
+   device->queue_families_[device->queue_family_graphics_compute_].queues.resize(
+-      std::max(static_cast<size_t>(1),
++      std::max(rex_wanted_queues,
+                device->queue_families_[device->queue_family_graphics_compute_].queues.size()));
++  REXUI_INFO("VulkanDevice: graphics/compute family {} queueCount={} allocated={}",
++             device->queue_family_graphics_compute_,
++             queue_families[device->queue_family_graphics_compute_].queueCount,
++             device->queue_families_[device->queue_family_graphics_compute_].queues.size());
+   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
+     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(
+         std::max(static_cast<size_t>(1),
+@@ -560,12 +567,18 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   REX_VK_LIMIT(nonCoherentAtomSize)
+ 
+   if (with_gpu_emulation) {
++#if !defined(__ANDROID__)
++    // REX_ANDROID_NO_ROBUST_BUFFER: avoid software bounds-check overhead on Adreno fetches
+     REX_VK_FEATURE(robustBufferAccess)
++#endif
+     REX_VK_FEATURE(fullDrawIndexUint32)
+     REX_VK_FEATURE(independentBlend)
+     REX_VK_FEATURE(geometryShader)
+     REX_VK_FEATURE(tessellationShader)
++#if !defined(__ANDROID__)
++    // REX_ANDROID_NO_SAMPLE_RATE_SHADING: avoid 2x per-sample fragment shading on Adreno
+     REX_VK_FEATURE(sampleRateShading)
++#endif
+     REX_VK_FEATURE(depthClamp)
+     REX_VK_FEATURE(fillModeNonSolid)
+     REX_VK_FEATURE(samplerAnisotropy)
+diff --git a/src/gpu/xenos/host/vulkan/vulkan_presenter.cpp b/src/gpu/xenos/host/vulkan/vulkan_presenter.cpp
+index 5645de16..0bf19cbc 100644
+--- a/src/gpu/xenos/host/vulkan/vulkan_presenter.cpp
++++ b/src/gpu/xenos/host/vulkan/vulkan_presenter.cpp
+@@ -1,3 +1,92 @@
++#if defined(__ANDROID__)
++#include <android/native_window.h>
++#include <dlfcn.h>
++#endif
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
++
++#if defined(__ANDROID__)
++#include <jni.h>
++std::atomic<bool> g_rex_android_unfocused{false};
++std::atomic<bool> g_rex_android_surface_alive{true};
++std::atomic<uint64_t> g_rex_android_surface_gen{0};
++std::mutex g_rex_android_window_mutex;
++ANativeWindow* g_rex_android_window = nullptr;
++uint64_t g_rex_connected_surface_gen = 0;
++
++extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
++Java_com_rexglue_pop_PopActivity_nativeSetUnfocused(JNIEnv*, jclass, jboolean unfocused) {
++  g_rex_android_unfocused.store(unfocused != JNI_FALSE, std::memory_order_release);
++}
++
++extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
++Java_com_rexglue_pop_PopActivity_nativeSetSurface(JNIEnv* env, jclass, jobject surface) {
++  using PFN_FromSurface = ANativeWindow* (*)(JNIEnv*, jobject);
++  using PFN_Release = void (*)(ANativeWindow*);
++  static PFN_FromSurface pfn_from_surface = nullptr;
++  static PFN_Release pfn_release = nullptr;
++  static bool android_syms_init = false;
++
++  std::lock_guard<std::mutex> lk(g_rex_android_window_mutex);
++  if (!android_syms_init) {
++    void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
++    if (lib) {
++      pfn_from_surface = reinterpret_cast<PFN_FromSurface>(dlsym(lib, "ANativeWindow_fromSurface"));
++      pfn_release = reinterpret_cast<PFN_Release>(dlsym(lib, "ANativeWindow_release"));
++    }
++    android_syms_init = true;
++  }
++  if (g_rex_android_window && pfn_release) {
++    pfn_release(g_rex_android_window);
++    g_rex_android_window = nullptr;
++  }
++  if (surface && pfn_from_surface) {
++    g_rex_android_window = pfn_from_surface(env, surface);
++  }
++  g_rex_android_surface_gen.fetch_add(1, std::memory_order_acq_rel);
++  g_rex_android_surface_alive.store(g_rex_android_window != nullptr, std::memory_order_release);
++}
++#endif
++
++namespace {
++#if defined(__ANDROID__)
++using PFN_TouchpadIncFrame = void (*)();
++std::atomic<bool> g_android_hook_init{false};
++PFN_TouchpadIncFrame g_touchpad_inc_frame = nullptr;
++
++// REX_PRESPERF_INSTRUMENT
++struct RexPresPerf {
++  uint64_t frames = 0;
++  int64_t acq_img_us = 0;
++  int64_t qsub_us = 0;
++  int64_t pres_us = 0;
++  std::chrono::steady_clock::time_point last_log{};
++  bool init = false;
++};
++RexPresPerf g_rex_pres_perf;
++
++void rex_android_on_present() {
++  if (!g_android_hook_init.exchange(true, std::memory_order_acq_rel)) {
++    void* h = dlopen("libtouchpad.so", RTLD_NOLOAD);
++    if (!h) {
++      h = dlopen("libtouchpad.so", RTLD_NOW | RTLD_LOCAL);
++    }
++    if (h) {
++      g_touchpad_inc_frame = reinterpret_cast<PFN_TouchpadIncFrame>(dlsym(h, "rex_touchpad_inc_frame"));
++    }
++    if (!g_touchpad_inc_frame) {
++      g_touchpad_inc_frame = reinterpret_cast<PFN_TouchpadIncFrame>(dlsym(RTLD_DEFAULT, "rex_touchpad_inc_frame"));
++    }
++  }
++  if (g_touchpad_inc_frame) {
++    g_touchpad_inc_frame();
++  }
++}
++#endif
++}  // namespace
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -170,6 +259,11 @@ gpu::Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
+   if (instance_extensions.ext_EXT_metal_surface) {
+     type_flags |= gpu::Surface::kTypeFlagCAMetalLayer;
+   }
++#endif
++#if defined(__ANDROID__)
++  if (instance_extensions.ext_KHR_android_surface) {
++    type_flags |= gpu::Surface::kTypeFlagAndroidWindow;
++  }
+ #endif
+   return type_flags;
+ }
+@@ -268,6 +362,19 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
+ 
+   VkFormat new_swapchain_format;
+ 
++#if defined(__ANDROID__)
++  if (!g_rex_android_surface_alive.load(std::memory_order_acquire)) {
++    paint_context_.DestroySwapchainAndVulkanSurface();
++    return SurfacePaintConnectResult::kFailure;
++  }
++  const uint64_t rex_target_surface_gen =
++      g_rex_android_surface_gen.load(std::memory_order_acquire);
++  if (paint_context_.vulkan_surface != VK_NULL_HANDLE &&
++      g_rex_connected_surface_gen != rex_target_surface_gen) {
++    paint_context_.DestroySwapchainAndVulkanSurface();
++  }
++#endif
++
+   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
+     bool surface_unusable;
+@@ -319,6 +426,28 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
+             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+       } break;
+ #endif
++#if defined(__ANDROID__)
++      case gpu::Surface::kTypeIndexAndroidWindow: {
++        auto& android_surface = static_cast<const gpu::NativeSurface&>(new_surface);
++        std::lock_guard<std::mutex> lk(g_rex_android_window_mutex);
++        ANativeWindow* live_window =
++            g_rex_android_window ? g_rex_android_window
++                                 : static_cast<ANativeWindow*>(android_surface.GetHWND());
++        if (!live_window || !g_rex_android_surface_alive.load(std::memory_order_acquire)) {
++          return SurfacePaintConnectResult::kFailure;
++        }
++        VkAndroidSurfaceCreateInfoKHR surface_create_info;
++        surface_create_info.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
++        surface_create_info.pNext = nullptr;
++        surface_create_info.flags = 0;
++        surface_create_info.window = live_window;
++        vulkan_surface_create_result = ifn.vkCreateAndroidSurfaceKHR(
++            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
++        if (vulkan_surface_create_result == VK_SUCCESS) {
++          g_rex_connected_surface_gen = rex_target_surface_gen;
++        }
++      } break;
++#endif
+ #if REX_PLATFORM_WIN32
+       case gpu::Surface::kTypeIndexWin32HWND: {
+         auto& win32_hwnd_surface = static_cast<const gpu::NativeSurface&>(new_surface);
+@@ -940,6 +1069,16 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+ }
+ 
+ Presenter::PaintResult VulkanPresenter::DriverPaintAndPresent(bool execute_ui_drawers) {
++#if defined(__ANDROID__)
++  if (g_rex_android_unfocused.load(std::memory_order_acquire) ||
++      !g_rex_android_surface_alive.load(std::memory_order_acquire)) {
++    std::this_thread::sleep_for(std::chrono::milliseconds(50));
++    return PaintResult::kNotPresented;
++  }
++  if (g_rex_android_surface_gen.load(std::memory_order_acquire) != g_rex_connected_surface_gen) {
++    return PaintResult::kNotPresentedConnectionOutdated;
++  }
++#endif
+   u64 current_paint_submission_index = paint_context_.submission_tracker.GetCurrentSubmission();
+   u64 paint_submission_count = static_cast<u64>(paint_context_.submissions.size());
+   if (current_paint_submission_index >= paint_submission_count) {
+@@ -974,9 +1113,17 @@ Presenter::PaintResult VulkanPresenter::DriverPaintAndPresent(bool execute_ui_dr
+ 
+   VkSemaphore acquire_semaphore = paint_submission.GetAcquireSemaphore();
+   u32 swapchain_image_index;
++#if defined(__ANDROID__)
++  const auto rex_ai_t0 = std::chrono::steady_clock::now();
++#endif
+   VkResult acquire_result =
+       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+                                 VK_NULL_HANDLE, &swapchain_image_index);
++#if defined(__ANDROID__)
++  g_rex_pres_perf.acq_img_us += std::chrono::duration_cast<std::chrono::microseconds>(
++                                    std::chrono::steady_clock::now() - rex_ai_t0)
++                                    .count();
++#endif
+   switch (acquire_result) {
+     case VK_SUCCESS:
+     case VK_SUBOPTIMAL_KHR:
+@@ -1334,6 +1481,9 @@ Presenter::PaintResult VulkanPresenter::DriverPaintAndPresent(bool execute_ui_dr
+     {
+       const VulkanDevice::Queue::Acquisition queue_acquisition =
+           vulkan_device_->AcquireQueue(vulkan_device_->GetQueueFamilyGraphicsCompute(), 0);
++#if defined(__ANDROID__)
++      const auto rex_qs_t0 = std::chrono::steady_clock::now();
++#endif
+       submit_result = dfn.vkQueueSubmit(queue_acquisition.GetQueue(), 1, &submit_info,
+                                         fence_acquisition.GetFence());
+       if (ui_fence_acquisition.GetFence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
+@@ -1342,6 +1492,11 @@ Presenter::PaintResult VulkanPresenter::DriverPaintAndPresent(bool execute_ui_dr
+           ui_fence_acquisition.MarkFenceSignalFailed();
+         }
+       }
++#if defined(__ANDROID__)
++      g_rex_pres_perf.qsub_us += std::chrono::duration_cast<std::chrono::microseconds>(
++                                     std::chrono::steady_clock::now() - rex_qs_t0)
++                                     .count();
++#endif
+     }
+     if (submit_result != VK_SUCCESS) {
+       REXUI_ERROR("VulkanPresenter: Failed to submit command buffers");
+@@ -1368,14 +1523,55 @@ Presenter::PaintResult VulkanPresenter::DriverPaintAndPresent(bool execute_ui_dr
+   present_info.pResults = nullptr;
+   VkResult present_result;
+   {
++    const u32 rex_present_q_idx =
++        vulkan_device_->GetQueueFamilies()[paint_context_.present_queue_family].queues.size() > 1
++            ? 1
++            : 0;
+     const VulkanDevice::Queue::Acquisition queue_acquisition =
+-        vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
++        vulkan_device_->AcquireQueue(paint_context_.present_queue_family, rex_present_q_idx);
++#if defined(__ANDROID__)
++    const auto rex_pr_t0 = std::chrono::steady_clock::now();
++#endif
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.GetQueue(), &present_info);
++#if defined(__ANDROID__)
++    const auto rex_pr_t1 = std::chrono::steady_clock::now();
++    g_rex_pres_perf.pres_us += std::chrono::duration_cast<std::chrono::microseconds>(
++                                   rex_pr_t1 - rex_pr_t0)
++                                   .count();
++    ++g_rex_pres_perf.frames;
++    if (!g_rex_pres_perf.init) {
++      g_rex_pres_perf.last_log = rex_pr_t1;
++      g_rex_pres_perf.init = true;
++    } else {
++      const int64_t el_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                                rex_pr_t1 - g_rex_pres_perf.last_log)
++                                .count();
++      if (el_us >= 2000000 && g_rex_pres_perf.frames > 0) {
++        const double f = static_cast<double>(g_rex_pres_perf.frames);
++        REXUI_INFO("PRESPERF fps={:.1f} acq_img={:.1f}ms qsub={:.1f}ms pres={:.1f}ms",
++                   f * 1000000.0 / static_cast<double>(el_us),
++                   static_cast<double>(g_rex_pres_perf.acq_img_us) / (f * 1000.0),
++                   static_cast<double>(g_rex_pres_perf.qsub_us) / (f * 1000.0),
++                   static_cast<double>(g_rex_pres_perf.pres_us) / (f * 1000.0));
++        g_rex_pres_perf.frames = 0;
++        g_rex_pres_perf.acq_img_us = 0;
++        g_rex_pres_perf.qsub_us = 0;
++        g_rex_pres_perf.pres_us = 0;
++        g_rex_pres_perf.last_log = rex_pr_t1;
++      }
++    }
++#endif
+   }
+   switch (present_result) {
+     case VK_SUCCESS:
++#if defined(__ANDROID__)
++      rex_android_on_present();
++#endif
+       return PaintResult::kPresented;
+     case VK_SUBOPTIMAL_KHR:
++#if defined(__ANDROID__)
++      rex_android_on_present();
++#endif
+       return PaintResult::kPresentedSuboptimal;
+     case VK_ERROR_DEVICE_LOST:
+       REXUI_FAIL(PaintResult::kGPULostResponsible,
+diff --git a/src/gpu/xenos/shared_memory.cpp b/src/gpu/xenos/shared_memory.cpp
+index 7db4abed..5486f5fd 100644
+--- a/src/gpu/xenos/shared_memory.cpp
++++ b/src/gpu/xenos/shared_memory.cpp
+@@ -439,10 +439,13 @@ bool SharedMemory::RequestRanges(const std::pair<u32, u32>* ranges, size_t count
+                    static_cast<u32>(upload_ranges_.size()));
+ 
+   if (upload_ranges_.empty()) {
+-    return true;
++    OnRangesRequested(merged_ranges);
++  return true;
+   }
+ 
+-  return UploadRanges(upload_ranges_);
++  if (!UploadRanges(upload_ranges_)) { return false; }
++  OnRangesRequested(merged_ranges);
++  return true;
+ }
+ 
+ bool SharedMemory::RequestRange(u32 start, u32 length) {
+@@ -450,6 +453,25 @@ bool SharedMemory::RequestRange(u32 start, u32 length) {
+   return RequestRanges(&range, 1);
+ }
+ 
++bool SharedMemory::ForceReuploadRange(u32 start, u32 length) {
++  if (!length || start >= kBufferSize) {
++    return true;
++  }
++  const u32 max_len = kBufferSize - start;
++  const u32 clamped_length = (length < max_len) ? length : max_len;
++  const u32 page_first = start >> page_size_log2_;
++  const u32 page_last = (start + clamped_length - 1u) >> page_size_log2_;
++  for (u32 page = page_first; page <= page_last; ++page) {
++    const size_t block = static_cast<size_t>(page >> 6);
++    const u64 bit = static_cast<u64>(1) << (page & 63u);
++    if (block < system_page_flags_valid_.size()) {
++      system_page_flags_valid_[block] &= ~bit;
++      system_page_flags_valid_and_gpu_written_[block] &= ~bit;
++    }
++  }
++  return RequestRange(start, clamped_length);
++}
++
+ PhysicalRange SharedMemory::OnPhysicalWrite(PhysicalRange range, bool exact_range) {
+   u32 physical_address_start = range.address;
+   u32 length = range.length;
+diff --git a/src/gpu/xenos/shared_memory.h b/src/gpu/xenos/shared_memory.h
+index 7ff20e23..f53f54d0 100644
+--- a/src/gpu/xenos/shared_memory.h
++++ b/src/gpu/xenos/shared_memory.h
+@@ -86,6 +86,7 @@ class REX_GPU_XENOS_API SharedMemory : public rex::NonCopyable, public IPhysical
+    */
+   bool RequestRanges(const std::pair<u32, u32>* ranges, size_t count);
+   bool RequestRange(u32 start, u32 length);
++  bool ForceReuploadRange(u32 start, u32 length);
+ 
+   /**
+    * Marks the range as modified by the CPU and invalidates GPU written pages inside it. Unless
+@@ -117,7 +118,9 @@ class REX_GPU_XENOS_API SharedMemory : public rex::NonCopyable, public IPhysical
+   static constexpr u32 kHostGPUMemoryOptimalSparseAllocationLog2 = 22;
+   static_assert(kHostGPUMemoryOptimalSparseAllocationLog2 <= kBufferSizeLog2);
+ 
++ public:
+   IPhysicalMemory& GetMemory() const { return physical_memory_; }
++ protected:
+ 
+   u32 GetPageSizeLog2() const { return page_size_log2_; }
+ 
+@@ -149,6 +152,7 @@ class REX_GPU_XENOS_API SharedMemory : public rex::NonCopyable, public IPhysical
+    * @param upload_page_ranges The page ranges as start and count pairs.
+    */
+   virtual bool UploadRanges(const std::vector<std::pair<u32, u32>>& upload_page_ranges) = 0;
++  virtual void OnRangesRequested(const std::vector<std::pair<u32, u32>>& merged_ranges) { (void)merged_ranges; }
+ 
+  private:
+   IPhysicalMemory& physical_memory_;
+diff --git a/src/gpu/xenos/vulkan/command_processor.cpp b/src/gpu/xenos/vulkan/command_processor.cpp
+index 97d4eff5..327ffa54 100644
+--- a/src/gpu/xenos/vulkan/command_processor.cpp
++++ b/src/gpu/xenos/vulkan/command_processor.cpp
+@@ -1,3 +1,34 @@
++#include <cstdlib>
++#if defined(__ANDROID__)
++#include <atomic>
++#include <thread>
++extern std::atomic<bool> g_rex_android_unfocused;
++extern std::atomic<uint64_t> g_rex_vk_resolves;
++extern std::atomic<uint64_t> g_rex_vk_dres;
++extern std::atomic<uint64_t> g_rex_vk_fres;
++extern std::atomic<uint64_t> g_rex_vk_uploads;
++extern std::atomic<uint64_t> g_rex_vk_hoisted;
++extern std::atomic<uint64_t> g_rex_vk_texloads;
++extern std::atomic<uint64_t> g_rex_gpu_total_ns;
++extern std::atomic<uint64_t> g_rex_gpu_rp_ns;
++extern std::atomic<uint64_t> g_rex_gpu_comp_ns;
++extern std::atomic<uint64_t> g_rex_gpu_copy_ns;
++extern std::atomic<uint64_t> g_rex_gpu_submits;
++extern std::atomic<uint64_t> g_rex_vk_draws;
++extern std::atomic<uint64_t> g_rex_vk_dispatches;
++static std::atomic<uint64_t> g_rex_vk_rps{0};
++static std::atomic<uint64_t> g_rex_vk_barriers{0};
++extern std::atomic<int64_t> g_rex_cp_stall_us;
++extern std::atomic<uint64_t> g_rex_cp_stall_count;
++extern std::atomic<int64_t> g_rex_cp_pb_us;
++extern std::atomic<uint64_t> g_rex_cp_pb_cnt;
++extern std::atomic<int64_t> g_rex_cp_draw_us;
++extern std::atomic<uint64_t> g_rex_cp_draw_cnt;
++extern std::atomic<int64_t> g_rex_cp_wrm_us;
++extern std::atomic<uint64_t> g_rex_cp_wrm_cnt;
++extern std::atomic<int64_t> g_rex_cp_pbend_us;
++#endif
++#include <chrono>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -2131,9 +2162,36 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
+ }
+ 
++// REX_VKPERF_INSTRUMENT
++#if defined(__ANDROID__)
++namespace {
++struct RexVkFramePerf {
++  uint64_t frames = 0;
++  uint64_t submits = 0;
++  uint64_t wait_calls = 0;
++  uint64_t sparse_binds = 0;
++  int64_t wait_us = 0;
++  int64_t exec_us = 0;
++  int64_t submit_us = 0;
++  int64_t swap_us = 0;
++  int64_t pipe_us = 0;
++  int64_t fl_us = 0;
++  int64_t rst_us = 0;
++  int64_t endcb_us = 0;
++  int64_t acq_us = 0;
++  std::chrono::steady_clock::time_point last_log{};
++  bool init = false;
++};
++RexVkFramePerf g_rex_vk_perf;
++}  // namespace
++#endif
++
+ void VulkanCommandProcessor::IssueSwap([[maybe_unused]] u32 frontbuffer_ptr, u32 frontbuffer_width,
+                                        u32 frontbuffer_height) {
+   REX_PROFILE_SCOPE("gpu");
++#if defined(__ANDROID__)
++  const auto rex_swap_t0 = std::chrono::steady_clock::now();
++#endif
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+@@ -2736,7 +2794,7 @@ void VulkanCommandProcessor::IssueSwap([[maybe_unused]] u32 frontbuffer_ptr, u32
+               nullptr);
+ 
+           deferred_command_buffer_.CmdVkDraw(3, 1, 0, 0);
+-          deferred_command_buffer_.CmdVkEndRenderPass();
++          do { deferred_command_buffer_.CmdVkEndRenderPass(); g_rex_vk_rps.fetch_add(1, std::memory_order_relaxed); if (shared_memory_) { shared_memory_->OnRenderPassEnded(); } } while (0);
+ 
+           PushImageMemoryBarrier(vulkan_context.GetImage(), guest_output_subresource_range,
+                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+@@ -2754,6 +2812,111 @@ void VulkanCommandProcessor::IssueSwap([[maybe_unused]] u32 frontbuffer_ptr, u32
+ 
+   // The frame ends even without presenting, otherwise per frame resources leak.
+   EndSubmission(true);
++#if defined(__ANDROID__)
++  const auto rex_swap_t1 = std::chrono::steady_clock::now();
++  g_rex_vk_perf.swap_us += std::chrono::duration_cast<std::chrono::microseconds>(
++                               rex_swap_t1 - rex_swap_t0)
++                               .count();
++  ++g_rex_vk_perf.frames;
++      // REX_SINGLE_SWAP_PACER: idle cleanly when minimized + single accurate FPS pacer
++      while (g_rex_android_unfocused.load(std::memory_order_acquire)) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(50));
++      }
++      {
++        static double s_cap_fps = -1.0;
++        static std::chrono::steady_clock::time_point s_next_swap{};
++        static bool s_pacer_init = false;
++        if (s_cap_fps < 0.0) {
++          s_cap_fps = 0.0;
++          const char* cap_str = std::getenv("REX_ANDROID_FPS_CAP");
++          if (cap_str && cap_str[0] != '\0') {
++            s_cap_fps = std::strtod(cap_str, nullptr);
++          }
++        }
++        if (s_cap_fps >= 15.0 && s_cap_fps <= 120.0) {
++          const auto period =
++              std::chrono::microseconds(static_cast<int64_t>(1000000.0 / s_cap_fps));
++          const auto now = std::chrono::steady_clock::now();
++          if (!s_pacer_init) {
++            s_next_swap = now + period;
++            s_pacer_init = true;
++          } else {
++            if (now < s_next_swap) {
++              std::this_thread::sleep_until(s_next_swap);
++            }
++            const auto after = std::chrono::steady_clock::now();
++            s_next_swap += period;
++            if (s_next_swap < after - std::chrono::milliseconds(4)) {
++              s_next_swap = after + period;
++            }
++          }
++        }
++      }
++  if (!g_rex_vk_perf.init) {
++    g_rex_vk_perf.last_log = rex_swap_t1;
++    g_rex_vk_perf.init = true;
++  } else {
++    const int64_t elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                                   rex_swap_t1 - g_rex_vk_perf.last_log)
++                                   .count();
++    if (elapsed_us >= 2000000 && g_rex_vk_perf.frames > 0) {
++      const double f = static_cast<double>(g_rex_vk_perf.frames);
++      (void)g_rex_cp_pb_us.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_cp_stall_us.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_cp_pbend_us.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_cp_pb_cnt.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_cp_draw_us.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_cp_draw_cnt.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_cp_wrm_us.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_cp_wrm_cnt.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_cp_stall_count.exchange(0, std::memory_order_relaxed);
++      const uint64_t rps      = g_rex_vk_rps.exchange(0, std::memory_order_relaxed);
++      const uint64_t bars     = g_rex_vk_barriers.exchange(0, std::memory_order_relaxed);
++      const uint64_t uploads  = g_rex_vk_uploads.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_vk_hoisted.exchange(0, std::memory_order_relaxed);
++      const uint64_t resolves = g_rex_vk_resolves.exchange(0, std::memory_order_relaxed);
++      const uint64_t dres     = g_rex_vk_dres.exchange(0, std::memory_order_relaxed);
++      const uint64_t fres     = g_rex_vk_fres.exchange(0, std::memory_order_relaxed);
++      const uint64_t texloads = g_rex_vk_texloads.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_gpu_total_ns.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_gpu_rp_ns.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_gpu_comp_ns.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_gpu_copy_ns.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_gpu_submits.exchange(0, std::memory_order_relaxed);
++      const uint64_t draws    = g_rex_vk_draws.exchange(0, std::memory_order_relaxed);
++      (void)g_rex_vk_dispatches.exchange(0, std::memory_order_relaxed);
++      REXGPU_WARN(
++          "VKPERF fps={:.1f} frame={:.1f}ms wait={:.1f}ms draws={:.0f}/f rp={:.0f}/f bar={:.0f}/f "
++          "res={:.0f}(d={:.0f} f={:.0f}) upl={:.0f} tex={:.0f} sub={:.1f}/f",
++          f * 1000000.0 / static_cast<double>(elapsed_us),
++          static_cast<double>(elapsed_us) / (f * 1000.0),
++          static_cast<double>(g_rex_vk_perf.wait_us) / (f * 1000.0),
++          static_cast<double>(draws) / f,
++          static_cast<double>(rps) / f,
++          static_cast<double>(bars) / f,
++          static_cast<double>(resolves) / f,
++          static_cast<double>(dres) / f,
++          static_cast<double>(fres) / f,
++          static_cast<double>(uploads) / f,
++          static_cast<double>(texloads) / f,
++          static_cast<double>(g_rex_vk_perf.submits) / f);
++      g_rex_vk_perf.frames = 0;
++      g_rex_vk_perf.submits = 0;
++      g_rex_vk_perf.wait_calls = 0;
++      g_rex_vk_perf.sparse_binds = 0;
++      g_rex_vk_perf.wait_us = 0;
++      g_rex_vk_perf.exec_us = 0;
++      g_rex_vk_perf.submit_us = 0;
++      g_rex_vk_perf.swap_us = 0;
++      g_rex_vk_perf.pipe_us = 0;
++      g_rex_vk_perf.fl_us = 0;
++      g_rex_vk_perf.rst_us = 0;
++      g_rex_vk_perf.endcb_us = 0;
++      g_rex_vk_perf.acq_us = 0;
++      g_rex_vk_perf.last_log = rex_swap_t1;
++    }
++  }
++#endif
+ }
+ 
+ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
+@@ -2884,6 +3047,9 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+     return false;
+   }
+   EndRenderPass();
++#if defined(__ANDROID__)
++  g_rex_vk_barriers.fetch_add(pending_barriers_.size(), std::memory_order_relaxed);
++#endif
+   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
+     auto it_next = std::next(it);
+     bool is_last = it_next == pending_barriers_.cend();
+@@ -2931,7 +3097,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+-      deferred_command_buffer_.CmdVkEndRenderPass();
++      do { deferred_command_buffer_.CmdVkEndRenderPass(); g_rex_vk_rps.fetch_add(1, std::memory_order_relaxed); if (shared_memory_) { shared_memory_->OnRenderPassEnded(); } } while (0);
+     }
+     in_render_pass_ = false;
+   }
+@@ -3003,7 +3169,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+-      deferred_command_buffer_.CmdVkEndRenderPass();
++      do { deferred_command_buffer_.CmdVkEndRenderPass(); g_rex_vk_rps.fetch_add(1, std::memory_order_relaxed); if (shared_memory_) { shared_memory_->OnRenderPassEnded(); } } while (0);
+     }
+     in_render_pass_ = false;
+   }
+@@ -3080,7 +3246,7 @@ void VulkanCommandProcessor::EndRenderPass() {
+   if (current_render_pass_ == VK_NULL_HANDLE) {
+     deferred_command_buffer_.CmdVkEndRendering();
+   } else {
+-    deferred_command_buffer_.CmdVkEndRenderPass();
++    do { deferred_command_buffer_.CmdVkEndRenderPass(); g_rex_vk_rps.fetch_add(1, std::memory_order_relaxed); if (shared_memory_) { shared_memory_->OnRenderPassEnded(); } } while (0);
+   }
+   current_render_pass_ = VK_NULL_HANDLE;
+   current_framebuffer_ = nullptr;
+@@ -4679,9 +4845,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(u64 await_submiss
+   size_t fences_total = submissions_in_flight_fences_.size();
+   size_t fences_awaited = 0;
+   if (await_submission > submission_completed_) {
++#if defined(__ANDROID__)
++    const auto rex_wait_t0 = std::chrono::steady_clock::now();
++#endif
+     VkResult wait_result =
+         dfn.vkWaitForFences(device, static_cast<u32>(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
++#if defined(__ANDROID__)
++    g_rex_vk_perf.wait_us += std::chrono::duration_cast<std::chrono::microseconds>(
++                                 std::chrono::steady_clock::now() - rex_wait_t0)
++                                 .count();
++    ++g_rex_vk_perf.wait_calls;
++#endif
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+@@ -4997,8 +5172,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+     EndRenderPass();
+ 
++
+     pipeline_cache_->EndSubmission();
+ 
++
+     render_target_cache_->EndSubmission();
+ 
+     primitive_processor_->EndSubmission();
+@@ -5007,6 +5184,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+     uniform_buffer_pool_->FlushWrites();
+ 
++
+     if (!sparse_memory_binds_.empty()) {
+       sparse_buffer_bind_infos_temp_.clear();
+       sparse_buffer_bind_infos_temp_.reserve(sparse_buffer_binds_.size());
+@@ -5040,6 +5218,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+             vulkan_device->AcquireQueue(vulkan_device->GetQueueFamilySparseBinding(), 0);
+         bind_sparse_result = dfn.vkQueueBindSparse(queue_acquisition.GetQueue(), 1,
+                                                    &bind_sparse_info, VK_NULL_HANDLE);
++#if defined(__ANDROID__)
++        ++g_rex_vk_perf.sparse_binds;
++#endif
+       }
+       if (bind_sparse_result != VK_SUCCESS) {
+         REXGPU_FAIL(false, "Failed to submit Vulkan sparse binds");
+@@ -5056,9 +5237,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+     REX_ASSERT(!command_buffers_writable_.empty());
+     CommandBuffer command_buffer = command_buffers_writable_.back();
++
+     if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
+       REXGPU_FAIL(false, "Failed to reset a Vulkan command pool");
+     }
++
+     VkCommandBufferBeginInfo command_buffer_begin_info;
+     command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+     command_buffer_begin_info.pNext = nullptr;
+@@ -5067,10 +5250,20 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     if (dfn.vkBeginCommandBuffer(command_buffer.buffer, &command_buffer_begin_info) != VK_SUCCESS) {
+       REXGPU_FAIL(false, "Failed to begin a Vulkan command buffer");
+     }
++
+     deferred_command_buffer_.Execute(command_buffer.buffer);
++
++#if defined(__ANDROID__)
++    const auto rex_endcb_t0 = std::chrono::steady_clock::now();
++#endif
+     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
+       REXGPU_FAIL(false, "Failed to end a Vulkan command buffer");
+     }
++#if defined(__ANDROID__)
++    g_rex_vk_perf.endcb_us += std::chrono::duration_cast<std::chrono::microseconds>(
++                                  std::chrono::steady_clock::now() - rex_endcb_t0)
++                                  .count();
++#endif
+ 
+     VkSubmitInfo submit_info;
+     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+@@ -5095,9 +5288,15 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     }
+     VkResult submit_result;
+     {
++
+       gpu::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+           vulkan_device->AcquireQueue(vulkan_device->GetQueueFamilyGraphicsCompute(), 0);
++
++
+       submit_result = dfn.vkQueueSubmit(queue_acquisition.GetQueue(), 1, &submit_info, fence);
++#if defined(__ANDROID__)
++      ++g_rex_vk_perf.submits;
++#endif
+     }
+     if (submit_result != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+diff --git a/src/gpu/xenos/vulkan/command_processor.h b/src/gpu/xenos/vulkan/command_processor.h
+index 80f1c216..423ff35b 100644
+--- a/src/gpu/xenos/vulkan/command_processor.h
++++ b/src/gpu/xenos/vulkan/command_processor.h
+@@ -218,6 +218,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+    * pipeline barriers that are not part of it. The submission must be open.
+    */
+   void EndRenderPass();
++  bool IsInRenderPass() const { return in_render_pass_; }
+ 
+   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
+       SingleTransientDescriptorLayout transient_descriptor_layout) const {
+@@ -536,7 +537,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::vector<VkFence> submissions_in_flight_fences_;
+   std::deque<std::pair<u64, VkSemaphore>> submissions_in_flight_semaphores_;
+ 
+-  static constexpr u32 kMaxFramesInFlight = 3;
++  static constexpr u32 kMaxFramesInFlight = 2;
+   bool frame_open_ = false;
+   bool frame_used_async_placeholder_pipeline_ = false;
+   u64 frame_current_ = 1;
+diff --git a/src/gpu/xenos/vulkan/deferred_command_buffer.cpp b/src/gpu/xenos/vulkan/deferred_command_buffer.cpp
+index fdefb09a..c4bcad8f 100644
+--- a/src/gpu/xenos/vulkan/deferred_command_buffer.cpp
++++ b/src/gpu/xenos/vulkan/deferred_command_buffer.cpp
+@@ -19,6 +19,153 @@
+ #include "gpu/xenos/vulkan/deferred_command_buffer.h"
+ #include <rex/math.h>
+ 
++#if defined(__ANDROID__)
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <mutex>
++
++std::atomic<uint64_t> g_rex_gpu_total_ns{0};
++std::atomic<uint64_t> g_rex_gpu_rp_ns{0};
++std::atomic<uint64_t> g_rex_gpu_comp_ns{0};
++std::atomic<uint64_t> g_rex_gpu_copy_ns{0};
++std::atomic<uint64_t> g_rex_gpu_submits{0};
++std::atomic<uint64_t> g_rex_vk_draws{0};
++std::atomic<uint64_t> g_rex_vk_dispatches{0};
++
++namespace {
++constexpr uint64_t kRexBakedSkipPsHash = 0x09F78A325236804AULL;
++constexpr size_t kRexMaxSkipPipes = 128;
++std::mutex g_rex_skip_pipes_mutex;
++std::atomic<uint64_t> g_rex_skip_pipes[kRexMaxSkipPipes];
++std::atomic<size_t> g_rex_skip_pipe_count{0};
++// 0 = skip all matching draws, 1 = filter OFF, 2 = keep 1 of 2, 3 = keep 1 of 3
++std::atomic<uint32_t> g_rex_ps_mode{0};
++
++// REX_GLOBAL_SMOKE_SKIP
++constexpr size_t kRexSmokeTableMask = 2047u;
++std::atomic<uint64_t> g_rex_smoke_keys[kRexSmokeTableMask + 1u];
++std::atomic<uint8_t> g_rex_smoke_kind[kRexSmokeTableMask + 1u];
++
++inline uint32_t RexGetSmokeMode() {
++  static uint32_t s_mode = 99u;
++  if (s_mode == 99u) {
++    s_mode = 1u;  // 1 = skip all 3D alpha/subtractive smoke, dust, mist & corruption haze
++    std::FILE* fp = std::fopen("/sdcard/Android/data/com.princeofpersia.files/files/smoke_mode.txt", "r");
++    if (fp) {
++      const int ch = std::fgetc(fp);
++      std::fclose(fp);
++      if (ch == '0') s_mode = 0u;
++      else if (ch == '1') s_mode = 1u;
++      else if (ch == '2') s_mode = 2u;
++    }
++  }
++  return s_mode;
++}
++
++inline uint8_t RexLookupSmokeKind(uint64_t pipe_handle) {
++  if (pipe_handle == 0u) return 0u;
++  size_t slot = static_cast<size_t>((pipe_handle * 11400714819323198485ULL) >> 53) & kRexSmokeTableMask;
++  for (size_t probe = 0; probe < 32u; ++probe) {
++    const uint64_t k = g_rex_smoke_keys[slot].load(std::memory_order_acquire);
++    if (k == 0u) return 0u;
++    if (k == pipe_handle) return g_rex_smoke_kind[slot].load(std::memory_order_relaxed);
++    slot = (slot + 1u) & kRexSmokeTableMask;
++  }
++  return 0u;
++}
++
++inline bool RexIsSkipPipeline(uint64_t pipe_handle) {
++  const size_t n = g_rex_skip_pipe_count.load(std::memory_order_acquire);
++  for (size_t i = 0; i < n; ++i) {
++    if (g_rex_skip_pipes[i].load(std::memory_order_relaxed) == pipe_handle) {
++      return true;
++    }
++  }
++  const uint32_t smode = RexGetSmokeMode();
++  if (smode != 0u) {
++    const uint8_t kind = RexLookupSmokeKind(pipe_handle);
++    if (kind == 1u || (smode >= 2u && kind == 2u)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++uint32_t RexRefreshPsMode() {
++  return g_rex_ps_mode.load(std::memory_order_relaxed);
++}
++}  // namespace
++
++namespace rex::gpu::vulkan {
++void RexRegisterSmokePipeline(uint64_t pipe_handle, const VkGraphicsPipelineCreateInfo* ci) {
++  if (pipe_handle == 0u || !ci || !ci->pDepthStencilState || !ci->pColorBlendState ||
++      !ci->pMultisampleState || ci->pColorBlendState->attachmentCount == 0u ||
++      !ci->pColorBlendState->pAttachments) {
++    return;
++  }
++  // Protect all 2D menus, HUD & fonts: only filter 3D 2x MSAA passes with active depth comparison
++  if (ci->pMultisampleState->rasterizationSamples != VK_SAMPLE_COUNT_2_BIT) {
++    return;
++  }
++  const bool depth_test = (ci->pDepthStencilState->depthTestEnable == VK_TRUE);
++  const bool depth_write = (ci->pDepthStencilState->depthWriteEnable == VK_TRUE);
++  const VkCompareOp depth_cmp = ci->pDepthStencilState->depthCompareOp;
++  if (!depth_test || depth_write ||
++      depth_cmp == VK_COMPARE_OP_ALWAYS || depth_cmp == VK_COMPARE_OP_NEVER) {
++    return;
++  }
++  const VkPipelineColorBlendAttachmentState& att0 = ci->pColorBlendState->pAttachments[0];
++  if (att0.blendEnable != VK_TRUE) {
++    return;
++  }
++  // Kind 1: alpha/premultiplied/subtractive smoke, dust, mist, fog & corruption clouds
++  // Kind 2: additive 3D VFX (glows, sparks, light magic)
++  const bool is_alpha_smoke =
++      (att0.dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA ||
++       att0.dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR ||
++       att0.dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA ||
++       att0.colorBlendOp == VK_BLEND_OP_REVERSE_SUBTRACT ||
++       att0.colorBlendOp == VK_BLEND_OP_SUBTRACT);
++  const uint8_t kind = is_alpha_smoke ? 1u : 2u;
++
++  std::lock_guard<std::mutex> lk(g_rex_skip_pipes_mutex);
++  size_t slot = static_cast<size_t>((pipe_handle * 11400714819323198485ULL) >> 53) & kRexSmokeTableMask;
++  for (size_t probe = 0; probe < 32u; ++probe) {
++    const uint64_t k = g_rex_smoke_keys[slot].load(std::memory_order_relaxed);
++    if (k == 0u || k == pipe_handle) {
++      g_rex_smoke_kind[slot].store(kind, std::memory_order_relaxed);
++      g_rex_smoke_keys[slot].store(pipe_handle, std::memory_order_release);
++      break;
++    }
++    slot = (slot + 1u) & kRexSmokeTableMask;
++  }
++}
++
++void RexRegisterPipelineMeta(uint64_t pipe_handle, uint64_t /*vs_h*/, uint64_t ps_h,
++                             uint32_t /*rp_k*/, uint32_t msaa_s, uint32_t b_mask,
++                             uint8_t /*d_test*/, uint8_t d_write) {
++  if (ps_h != kRexBakedSkipPsHash || pipe_handle == 0 ||
++      msaa_s != 2 || b_mask == 0 || d_write != 0) {
++    return;
++  }
++  std::lock_guard<std::mutex> lk(g_rex_skip_pipes_mutex);
++  const size_t n = g_rex_skip_pipe_count.load(std::memory_order_relaxed);
++  for (size_t i = 0; i < n; ++i) {
++    if (g_rex_skip_pipes[i].load(std::memory_order_relaxed) == pipe_handle) {
++      return;
++    }
++  }
++  if (n < kRexMaxSkipPipes) {
++    g_rex_skip_pipes[n].store(pipe_handle, std::memory_order_relaxed);
++    g_rex_skip_pipe_count.store(n + 1, std::memory_order_release);
++  }
++}
++}  // namespace rex::gpu::vulkan
++#endif
++
+ namespace rex::gpu::vulkan {
+ 
+ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
+@@ -28,10 +175,20 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
+ }
+ 
+ void DeferredCommandBuffer::Reset() {
++  hoisted_slots_.clear();
++  hoisted_nodes_.clear();
++  hoisted_regions_.clear();
++  active_hoist_slot_ = UINT32_MAX;
+   command_stream_.Clear();
+ }
+ 
+ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
++#if defined(__ANDROID__)
++  bool rex_skip_cur_pipe = false;
++  const uint32_t rex_ps_mode = RexRefreshPsMode();
++  uint32_t rex_rp_skip_idx = 0;
++#endif
++
+ #if REXGPU_FINE_GRAINED_DRAW_SCOPES
+   REX_PROFILE_SCOPE("gpu");
+ #endif  // REXGPU_FINE_GRAINED_DRAW_SCOPES
+@@ -64,6 +221,47 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+         } else {
+           render_pass_begin_info.pClearValues = nullptr;
+         }
++                if (args.hoist_slot < hoisted_slots_.size()) {
++          u32 node_idx = hoisted_slots_[args.hoist_slot].head;
++          if (node_idx != UINT32_MAX) {
++            VkMemoryBarrier pre_barrier = {};
++            pre_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++            pre_barrier.srcAccessMask =
++                VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
++                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++            pre_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            dfn.vkCmdPipelineBarrier(
++                command_buffer,
++                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
++                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
++                    VK_PIPELINE_STAGE_TRANSFER_BIT,
++                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &pre_barrier, 0, nullptr, 0, nullptr);
++            while (node_idx != UINT32_MAX) {
++              const HoistedCopyNode& node = hoisted_nodes_[node_idx];
++              dfn.vkCmdCopyBuffer(command_buffer, node.src_buffer, node.dst_buffer,
++                                  node.region_count, hoisted_regions_.data() + node.first_region);
++              node_idx = node.next;
++            }
++            VkMemoryBarrier post_barrier = {};
++            post_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++            post_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            post_barrier.dstAccessMask =
++                VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
++                VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
++                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
++                VK_ACCESS_TRANSFER_WRITE_BIT;
++            dfn.vkCmdPipelineBarrier(
++                command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
++                    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                0, 1, &post_barrier, 0, nullptr, 0, nullptr);
++          }
++        }
++#if defined(__ANDROID__)
++        rex_rp_skip_idx = 0;
++#endif
+         dfn.vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, args.contents);
+       } break;
+ 
+@@ -98,7 +296,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+ 
+       case Command::kVkBindPipeline: {
+         auto& args = *reinterpret_cast<const ArgsVkBindPipeline*>(stream);
+-        dfn.vkCmdBindPipeline(command_buffer, args.pipeline_bind_point, args.pipeline);
++        #if defined(__ANDROID__)
++      if (args.pipeline_bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
++        rex_skip_cur_pipe = RexIsSkipPipeline(reinterpret_cast<uint64_t>(args.pipeline));
++      }
++#endif
++      dfn.vkCmdBindPipeline(command_buffer, args.pipeline_bind_point, args.pipeline);
+       } break;
+ 
+       case Command::kVkBindVertexBuffers: {
+@@ -170,14 +373,44 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+ 
+       case Command::kVkDraw: {
+         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
+-        dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
++        #if defined(__ANDROID__)
++      {
++        bool rex_do_skip = false;
++        if (rex_skip_cur_pipe && rex_ps_mode != 1u) {
++          const uint32_t idx = rex_rp_skip_idx++;
++          rex_do_skip = (rex_ps_mode == 0u) ? true : ((idx % rex_ps_mode) != 0u);
++        }
++        if (!rex_do_skip) {
++          g_rex_vk_draws.fetch_add(1, std::memory_order_relaxed);
++          dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
+                       args.first_instance);
++        }
++      }
++#else
++      dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
++                      args.first_instance);
++#endif
+       } break;
+ 
+       case Command::kVkDrawIndexed: {
+         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
+-        dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
++        #if defined(__ANDROID__)
++      {
++        bool rex_do_skip = false;
++        if (rex_skip_cur_pipe && rex_ps_mode != 1u) {
++          const uint32_t idx = rex_rp_skip_idx++;
++          rex_do_skip = (rex_ps_mode == 0u) ? true : ((idx % rex_ps_mode) != 0u);
++        }
++        if (!rex_do_skip) {
++          g_rex_vk_draws.fetch_add(1, std::memory_order_relaxed);
++          dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
++                             args.first_index, args.vertex_offset, args.first_instance);
++        }
++      }
++#else
++      dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
+                              args.first_index, args.vertex_offset, args.first_instance);
++#endif
+       } break;
+ 
+       case Command::kVkEndQuery: {
+diff --git a/src/gpu/xenos/vulkan/deferred_command_buffer.h b/src/gpu/xenos/vulkan/deferred_command_buffer.h
+index 23552ca6..33a56a5d 100644
+--- a/src/gpu/xenos/vulkan/deferred_command_buffer.h
++++ b/src/gpu/xenos/vulkan/deferred_command_buffer.h
+@@ -52,6 +52,10 @@ class DeferredCommandBuffer {
+     args.render_area = render_pass_begin->renderArea;
+     args.clear_value_count = clear_value_count;
+     args.contents = contents;
++    u32 hoist_slot = static_cast<u32>(hoisted_slots_.size());
++    hoisted_slots_.push_back({});
++    active_hoist_slot_ = hoist_slot;
++    args.hoist_slot = hoist_slot;
+     if (clear_value_count) {
+       std::memcpy(args_ptr + clear_values_offset, render_pass_begin->pClearValues,
+                   sizeof(VkClearValue) * clear_value_count);
+@@ -262,7 +266,30 @@ class DeferredCommandBuffer {
+     args.query = query;
+   }
+ 
+-  void CmdVkEndRenderPass() { WriteCommand(Command::kVkEndRenderPass, 0); }
++  void CmdVkEndRenderPass() {
++    active_hoist_slot_ = UINT32_MAX;
++    WriteCommand(Command::kVkEndRenderPass, 0);
++  }
++
++  bool AppendHoistedBufferCopy(VkBuffer src_buffer, VkBuffer dst_buffer, u32 region_count,
++                               const VkBufferCopy* regions) {
++    if (active_hoist_slot_ == UINT32_MAX || !region_count) {
++      return false;
++    }
++    u32 first_region = static_cast<u32>(hoisted_regions_.size());
++    hoisted_regions_.insert(hoisted_regions_.end(), regions, regions + region_count);
++    u32 node_idx = static_cast<u32>(hoisted_nodes_.size());
++    hoisted_nodes_.push_back({src_buffer, dst_buffer, first_region, region_count, UINT32_MAX});
++    HoistedSlot& slot = hoisted_slots_[active_hoist_slot_];
++    if (slot.head == UINT32_MAX) {
++      slot.head = node_idx;
++      slot.tail = node_idx;
++    } else {
++      hoisted_nodes_[slot.tail].next = node_idx;
++      slot.tail = node_idx;
++    }
++    return true;
++  }
+ 
+   // Requires VK_KHR_dynamic_rendering or Vulkan 1.3.
+   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
+@@ -395,6 +422,7 @@ class DeferredCommandBuffer {
+     VkRect2D render_area;
+     u32 clear_value_count;
+     VkSubpassContents contents;
++    u32 hoist_slot;
+     // Followed by aligned optional VkClearValue[].
+     static_assert(alignof(VkClearValue) <= alignof(uintmax_t));
+   };
+@@ -578,6 +606,22 @@ class DeferredCommandBuffer {
+ 
+   /** uintmax_t elements give uint64_t and pointer alignment to all structures. */
+   Stream command_stream_;
++
++  struct HoistedSlot {
++    u32 head = UINT32_MAX;
++    u32 tail = UINT32_MAX;
++  };
++  struct HoistedCopyNode {
++    VkBuffer src_buffer;
++    VkBuffer dst_buffer;
++    u32 first_region;
++    u32 region_count;
++    u32 next;
++  };
++  std::vector<HoistedSlot> hoisted_slots_;
++  std::vector<HoistedCopyNode> hoisted_nodes_;
++  std::vector<VkBufferCopy> hoisted_regions_;
++  u32 active_hoist_slot_ = UINT32_MAX;
+ };
+ 
+ }  // namespace rex::gpu::vulkan
+diff --git a/src/gpu/xenos/vulkan/pipeline_cache.cpp b/src/gpu/xenos/vulkan/pipeline_cache.cpp
+index d476c48e..790d6bdb 100644
+--- a/src/gpu/xenos/vulkan/pipeline_cache.cpp
++++ b/src/gpu/xenos/vulkan/pipeline_cache.cpp
+@@ -54,6 +54,172 @@
+ #include <rex/types.h>
+ #include "gpu/xenos/host/vulkan/vulkan_objects.h"
+ 
++#if defined(__ANDROID__)
++#if defined(__ANDROID__)
++// REX_POP_VK_PRECOMPILE_HOOK
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <dlfcn.h>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace rex_pop_vk {
++
++using PfnShaderBegin = void (*)(int32_t);
++using PfnShaderStep  = void (*)();
++using PfnShaderEnd   = void (*)();
++
++struct TouchFns {
++  PfnShaderBegin begin_fn = nullptr;
++  PfnShaderStep  step_fn  = nullptr;
++  PfnShaderEnd   end_fn   = nullptr;
++  bool resolved = false;
++};
++
++inline TouchFns& GetTouchFns() {
++  static TouchFns tf;
++  static std::mutex tf_mtx;
++  std::lock_guard<std::mutex> lk(tf_mtx);
++  if (!tf.resolved) {
++    void* h = ::dlopen("libtouchpad.so", RTLD_NOLOAD);
++    if (!h) h = ::dlopen("libtouchpad.so", RTLD_NOW | RTLD_LOCAL);
++    if (h) {
++      tf.begin_fn = reinterpret_cast<PfnShaderBegin>(::dlsym(h, "rex_touchpad_shader_begin"));
++      tf.step_fn  = reinterpret_cast<PfnShaderStep>(::dlsym(h, "rex_touchpad_shader_step"));
++      tf.end_fn   = reinterpret_cast<PfnShaderEnd>(::dlsym(h, "rex_touchpad_shader_end"));
++    }
++    if (!tf.begin_fn) tf.begin_fn = reinterpret_cast<PfnShaderBegin>(::dlsym(RTLD_DEFAULT, "rex_touchpad_shader_begin"));
++    if (!tf.step_fn)  tf.step_fn  = reinterpret_cast<PfnShaderStep>(::dlsym(RTLD_DEFAULT, "rex_touchpad_shader_step"));
++    if (!tf.end_fn)   tf.end_fn   = reinterpret_cast<PfnShaderEnd>(::dlsym(RTLD_DEFAULT, "rex_touchpad_shader_end"));
++    tf.resolved = true;
++  }
++  return tf;
++}
++
++inline void NotifyShaderBegin(int32_t total) {
++  auto& tf = GetTouchFns();
++  if (tf.begin_fn) tf.begin_fn(total);
++}
++
++inline void NotifyShaderStep() {
++  auto& tf = GetTouchFns();
++  if (tf.step_fn) tf.step_fn();
++}
++
++inline void NotifyShaderEnd() {
++  auto& tf = GetTouchFns();
++  if (tf.end_fn) tf.end_fn();
++}
++
++struct ShaderLoadGuard {
++  ~ShaderLoadGuard() { NotifyShaderEnd(); }
++};
++
++struct VkCacheState {
++  std::mutex mtx;
++  bool init = false;
++  VkDevice dev = VK_NULL_HANDLE;
++  VkPipelineCache cache = VK_NULL_HANDLE;
++  PFN_vkGetPipelineCacheData pfn_get_data = nullptr;
++  std::string path;
++  std::atomic<uint32_t> runtime_creates{0};
++};
++
++inline VkCacheState& GetVkCacheState() {
++  static VkCacheState st;
++  return st;
++}
++
++inline VkPipelineCache GetOrCreateVkCache(VkDevice dev) {
++  auto& st = GetVkCacheState();
++  if (st.init) return st.cache;
++  std::lock_guard<std::mutex> lk(st.mtx);
++  if (st.init) return st.cache;
++  st.init = true;
++  st.dev = dev;
++
++  const char* env_p = std::getenv("REX_POP_VKCACHE_PATH");
++  if (!env_p || env_p[0] == '\0') return VK_NULL_HANDLE;
++  st.path = env_p;
++
++  void* vk_lib = ::dlopen("libvulkan.so", RTLD_NOLOAD);
++  if (!vk_lib) vk_lib = ::dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
++  auto get_dev_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
++      vk_lib ? ::dlsym(vk_lib, "vkGetDeviceProcAddr") : ::dlsym(RTLD_DEFAULT, "vkGetDeviceProcAddr"));
++  if (!get_dev_proc) return VK_NULL_HANDLE;
++
++  auto pfn_create = reinterpret_cast<PFN_vkCreatePipelineCache>(get_dev_proc(dev, "vkCreatePipelineCache"));
++  st.pfn_get_data = reinterpret_cast<PFN_vkGetPipelineCacheData>(get_dev_proc(dev, "vkGetPipelineCacheData"));
++  if (!pfn_create) return VK_NULL_HANDLE;
++
++  std::vector<uint8_t> init_data;
++  if (std::FILE* fp = std::fopen(st.path.c_str(), "rb")) {
++    std::fseek(fp, 0, SEEK_END);
++    const long fsz = std::ftell(fp);
++    std::fseek(fp, 0, SEEK_SET);
++    if (fsz > 0 && fsz <= 64L * 1024L * 1024L) {
++      init_data.resize(static_cast<size_t>(fsz));
++      if (std::fread(init_data.data(), 1, init_data.size(), fp) != init_data.size()) {
++        init_data.clear();
++      }
++    }
++    std::fclose(fp);
++  }
++
++  VkPipelineCacheCreateInfo ci{};
++  ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++  ci.initialDataSize = init_data.size();
++  ci.pInitialData = init_data.empty() ? nullptr : init_data.data();
++  if (pfn_create(dev, &ci, nullptr, &st.cache) != VK_SUCCESS) {
++    st.cache = VK_NULL_HANDLE;
++  }
++  return st.cache;
++}
++
++inline void SaveVkCache() {
++  auto& st = GetVkCacheState();
++  std::lock_guard<std::mutex> lk(st.mtx);
++  if (st.cache == VK_NULL_HANDLE || st.dev == VK_NULL_HANDLE || !st.pfn_get_data || st.path.empty()) {
++    return;
++  }
++  size_t sz = 0;
++  if (st.pfn_get_data(st.dev, st.cache, &sz, nullptr) != VK_SUCCESS || sz == 0 || sz > 64u * 1024u * 1024u) {
++    return;
++  }
++  std::vector<uint8_t> data(sz);
++  if (st.pfn_get_data(st.dev, st.cache, &sz, data.data()) != VK_SUCCESS || sz == 0) {
++    return;
++  }
++  const std::string tmp_path = st.path + ".tmp";
++  if (std::FILE* fp = std::fopen(tmp_path.c_str(), "wb")) {
++    const size_t written = std::fwrite(data.data(), 1, sz, fp);
++    std::fclose(fp);
++    if (written == sz) {
++      ::rename(tmp_path.c_str(), st.path.c_str());
++    }
++  }
++}
++
++inline void MaybeSaveVkCacheRuntime() {
++  auto& st = GetVkCacheState();
++  const uint32_t n = st.runtime_creates.fetch_add(1, std::memory_order_relaxed) + 1u;
++  if ((n % 50u) == 0u) {
++    SaveVkCache();
++  }
++}
++
++}  // namespace rex_pop_vk
++#endif
++
++namespace rex::gpu::vulkan {
++void RexRegisterSmokePipeline(uint64_t pipe_handle, const VkGraphicsPipelineCreateInfo* ci);
++void RexRegisterPipelineMeta(uint64_t pipe_handle, uint64_t vs_h, uint64_t ps_h, uint32_t rp_k,
++                             uint32_t msaa_s, uint32_t b_mask, uint8_t d_test, uint8_t d_write);
++}  // namespace rex::gpu::vulkan
++#endif
+ namespace rex::gpu::vulkan {
+ 
+ namespace {
+@@ -189,6 +355,9 @@ bool VulkanPipelineCache::Initialize() {
+ 
+ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                   u32 title_id, bool blocking) {
++#if defined(__ANDROID__)
++  rex_pop_vk::ShaderLoadGuard pop_shader_load_guard;
++#endif
+   ShutdownShaderStorage();
+   {
+     std::lock_guard<std::mutex> lock(creation_request_lock_);
+@@ -435,6 +604,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+     }
+     creation_thread_count = std::min(creation_thread_count, pipeline_creations.size());
+ 
++#if defined(__ANDROID__)
++    rex_pop_vk::NotifyShaderBegin(static_cast<int32_t>(pipeline_creations.size()));
++#endif
+     std::atomic<size_t> next_creation_index(0);
+     std::atomic<size_t> created_pipeline_count(0);
+     auto creation_worker = [this, &pipeline_creations, &next_creation_index,
+@@ -447,6 +619,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+         if (CreatePipeline(pipeline_creations[creation_index])) {
+           created_pipeline_count.fetch_add(1);
+         }
++#if defined(__ANDROID__)
++        rex_pop_vk::NotifyShaderStep();
++#endif
+       }
+     };
+ 
+@@ -473,6 +648,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       std::lock_guard<std::mutex> lock(creation_request_lock_);
+       startup_loading_ = false;
+     }
++#if defined(__ANDROID__)
++    rex_pop_vk::SaveVkCache();
++#endif
+   }
+ 
+   platform::ResetStorageFile(
+@@ -3079,8 +3257,41 @@ bool VulkanPipelineCache::CreatePipeline(const PipelineCreationArguments& creati
+   const gpu::vulkan::VulkanDevice::Functions& dfn = vulkan_device->GetFunctions();
+   const VkDevice device = vulkan_device->GetDevice();
+   VkPipeline pipeline;
++#if defined(__ANDROID__)
++  VkPipelineCache pop_vk_cache = rex_pop_vk::GetOrCreateVkCache(device);
++  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, pop_vk_cache, 1,
++#else
+   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++#endif
+                                                          &pipeline_create_info, nullptr, &pipeline);
++#if defined(__ANDROID__)
++  if (create_result == VK_SUCCESS) {
++    uint32_t rex_blend_mask = 0;
++    if (pipeline_create_info.pColorBlendState &&
++        pipeline_create_info.pColorBlendState->pAttachments) {
++      uint32_t rex_blend_cnt = pipeline_create_info.pColorBlendState->attachmentCount;
++      for (uint32_t rex_bi = 0; rex_bi < rex_blend_cnt && rex_bi < 8; ++rex_bi) {
++        if (pipeline_create_info.pColorBlendState->pAttachments[rex_bi].blendEnable) {
++          rex_blend_mask |= (1u << rex_bi);
++        }
++      }
++    }
++    uint8_t rex_dt = (pipeline_create_info.pDepthStencilState &&
++                      pipeline_create_info.pDepthStencilState->depthTestEnable) ? 1 : 0;
++    uint8_t rex_dw = (pipeline_create_info.pDepthStencilState &&
++                      pipeline_create_info.pDepthStencilState->depthWriteEnable) ? 1 : 0;
++    RexRegisterSmokePipeline(reinterpret_cast<uint64_t>(pipeline), &pipeline_create_info);
++    RexRegisterPipelineMeta(
++        reinterpret_cast<uint64_t>(pipeline),
++        creation_arguments.vertex_shader->GetShader().GetUcodeDataHash(),
++        creation_arguments.pixel_shader
++            ? creation_arguments.pixel_shader->GetShader().GetUcodeDataHash()
++            : 0,
++        description.render_pass_key.key,
++        static_cast<uint32_t>(multisample_state.rasterizationSamples),
++        rex_blend_mask, rex_dt, rex_dw);
++  }
++#endif
+   if (create_result != VK_SUCCESS) {
+     u64 ps_hash = creation_arguments.pixel_shader
+                       ? creation_arguments.pixel_shader->GetShader().GetUcodeDataHash()
+diff --git a/src/gpu/xenos/vulkan/render_target_cache.cpp b/src/gpu/xenos/vulkan/render_target_cache.cpp
+index 388026e1..8c8c9ba7 100644
+--- a/src/gpu/xenos/vulkan/render_target_cache.cpp
++++ b/src/gpu/xenos/vulkan/render_target_cache.cpp
+@@ -1,3 +1,10 @@
++#if defined(__ANDROID__)
++#include <atomic>
++// REX_RTINFO_TELEM
++std::atomic<uint64_t> g_rex_vk_resolves{0};
++std::atomic<uint64_t> g_rex_vk_dres{0};
++std::atomic<uint64_t> g_rex_vk_fres{0};
++#endif
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -1046,6 +1053,9 @@ void VulkanRenderTargetCache::EndSubmission() {
+ bool VulkanRenderTargetCache::Resolve(IPhysicalMemory& memory, VulkanSharedMemory& shared_memory,
+                                       VulkanTextureCache& texture_cache, u32& written_address_out,
+                                       u32& written_length_out) {
++#if defined(__ANDROID__)
++  g_rex_vk_resolves.fetch_add(1, std::memory_order_relaxed);
++#endif
+   written_address_out = 0;
+   written_length_out = 0;
+ 
+@@ -1085,8 +1095,14 @@ bool VulkanRenderTargetCache::Resolve(IPhysicalMemory& memory, VulkanSharedMemor
+           direct_resolved = TryDirectResolve(resolve_info, copy_shader, draw_resolution_scaled);
+           if (direct_resolved) {
+             ++direct_resolve_success_count_;
++#if defined(__ANDROID__)
++            g_rex_vk_dres.fetch_add(1, std::memory_order_relaxed);
++#endif
+           } else {
+             ++direct_resolve_fallback_count_;
++#if defined(__ANDROID__)
++            g_rex_vk_fres.fetch_add(1, std::memory_order_relaxed);
++#endif
+           }
+         }
+         if (!direct_resolved) {
+@@ -1788,11 +1804,37 @@ std::unique_ptr<RenderTargetCache::RenderTarget> VulkanRenderTargetCache::Create
+     REXGPU_FAIL(nullptr, "VulkanRenderTargetCache: Unknown {} render target format {}",
+                 key.is_depth ? "depth" : "color", static_cast<u32>(key.resource_format));
+   }
++#if defined(__ANDROID__) && defined(VK_KHR_image_format_list)
++  // REX_ADRENO_UBWC_FORMAT_LIST
++  VkFormat rex_view_formats[2] = {image_create_info.format, transfer_format};
++  VkImageFormatListCreateInfoKHR rex_format_list_info = {};
++  const void* rex_orig_pnext = image_create_info.pNext;
++  bool rex_added_fmt_list = false;
++  if ((image_create_info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
++      transfer_format != VK_FORMAT_UNDEFINED &&
++      transfer_format != image_create_info.format) {
++    rex_format_list_info.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR;
++    rex_format_list_info.pNext = rex_orig_pnext;
++    rex_format_list_info.viewFormatCount = 2;
++    rex_format_list_info.pViewFormats = rex_view_formats;
++    image_create_info.pNext = &rex_format_list_info;
++    rex_added_fmt_list = true;
++  }
++#endif
+   VkImage image;
+   VkDeviceMemory memory;
+-  if (!gpu::vulkan::objects::CreateDedicatedAllocationImage(
+-          vulkan_device, image_create_info, gpu::vulkan::objects::MemoryPurpose::kDeviceLocal,
+-          image, memory)) {
++  bool rex_img_ok = gpu::vulkan::objects::CreateDedicatedAllocationImage(
++      vulkan_device, image_create_info, gpu::vulkan::objects::MemoryPurpose::kDeviceLocal,
++      image, memory);
++#if defined(__ANDROID__) && defined(VK_KHR_image_format_list)
++  if (!rex_img_ok && rex_added_fmt_list) {
++    image_create_info.pNext = rex_orig_pnext;
++    rex_img_ok = gpu::vulkan::objects::CreateDedicatedAllocationImage(
++        vulkan_device, image_create_info, gpu::vulkan::objects::MemoryPurpose::kDeviceLocal,
++        image, memory);
++  }
++#endif
++  if (!rex_img_ok) {
+     REXGPU_FAIL(nullptr,
+                 "VulkanRenderTarget: Failed to create a {}x{} {}xMSAA {} render target "
+                 "image",
+diff --git a/src/gpu/xenos/vulkan/shared_memory.cpp b/src/gpu/xenos/vulkan/shared_memory.cpp
+index 7b914607..0e790527 100644
+--- a/src/gpu/xenos/vulkan/shared_memory.cpp
++++ b/src/gpu/xenos/vulkan/shared_memory.cpp
+@@ -1,3 +1,8 @@
++#if defined(__ANDROID__)
++#include <atomic>
++std::atomic<uint64_t> g_rex_vk_uploads{0};
++std::atomic<uint64_t> g_rex_vk_hoisted{0};
++#endif
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -157,9 +162,33 @@ bool VulkanSharedMemory::Initialize() {
+       rex::RoundUpPow2(gpu::vulkan::VulkanUploadBufferPool::kDefaultPageSize,
+                        static_cast<size_t>(1) << GetPageSizeLog2()));
+ 
++  rp_read_gen_.assign(static_cast<size_t>(1) << (kBufferSizeLog2 - GetPageSizeLog2()), 0);
++  current_rp_gen_ = 1;
+   return true;
+ }
+ 
++void VulkanSharedMemory::OnRenderPassEnded() {
++  if (++current_rp_gen_ == 0) {
++    std::fill(rp_read_gen_.begin(), rp_read_gen_.end(), 0);
++    current_rp_gen_ = 1;
++  }
++}
++
++void VulkanSharedMemory::OnRangesRequested(const std::vector<std::pair<u32, u32>>& merged_ranges) {
++  if (rp_read_gen_.empty()) {
++    return;
++  }
++  const u32 page_shift = GetPageSizeLog2();
++  const u32 gen = current_rp_gen_;
++  for (const auto& r : merged_ranges) {
++    u32 p_first = r.first >> page_shift;
++    u32 p_last = (r.first + r.second - 1) >> page_shift;
++    for (u32 p = p_first; p <= p_last; ++p) {
++      rp_read_gen_[p] = gen;
++    }
++  }
++}
++
+ void VulkanSharedMemory::Shutdown(bool from_destructor) {
+   upload_buffer_pool_.reset();
+ 
+@@ -256,13 +285,40 @@ bool VulkanSharedMemory::UploadRanges(const std::vector<std::pair<u32, u32>>& up
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
+-  // The ranges are sorted, so front and back bound the barrier.
+-  Use(Usage::kTransferDestination,
+-      std::make_pair(upload_page_ranges.front().first << GetPageSizeLog2(),
+-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
+-                      upload_page_ranges.front().first)
+-                         << GetPageSizeLog2()));
+-  command_processor_.SubmitBarriers(true);
++#if defined(__ANDROID__)
++  g_rex_vk_uploads.fetch_add(1, std::memory_order_relaxed);
++#endif
++  bool hoist_to_pre_rp = command_processor_.IsInRenderPass() &&
++                         last_usage_ == Usage::kRead &&
++                         last_written_range_.second == 0 && !rp_read_gen_.empty();
++  if (hoist_to_pre_rp) {
++    const u32 gen = current_rp_gen_;
++    for (const auto& r : upload_page_ranges) {
++      u32 p_end = r.first + r.second;
++      for (u32 p = r.first; p < p_end; ++p) {
++        if (rp_read_gen_[p] == gen) {
++          hoist_to_pre_rp = false;
++          break;
++        }
++      }
++      if (!hoist_to_pre_rp) {
++        break;
++      }
++    }
++  }
++  if (hoist_to_pre_rp) {
++#if defined(__ANDROID__)
++    g_rex_vk_hoisted.fetch_add(1, std::memory_order_relaxed);
++#endif
++  } else {
++    // The ranges are sorted, so front and back bound the barrier.
++    Use(Usage::kTransferDestination,
++        std::make_pair(upload_page_ranges.front().first << GetPageSizeLog2(),
++                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
++                        upload_page_ranges.front().first)
++                           << GetPageSizeLog2()));
++    command_processor_.SubmitBarriers(true);
++  }
+   DeferredCommandBuffer& command_buffer = command_processor_.GetDeferredCommandBuffer();
+   u64 submission_current = command_processor_.GetCurrentSubmission();
+   bool successful = true;
+@@ -295,9 +351,14 @@ bool VulkanSharedMemory::UploadRanges(const std::vector<std::pair<u32, u32>>& up
+       std::memcpy(upload_buffer_mapping, upload_source, upload_buffer_size);
+       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
+         REX_ASSERT(upload_buffer_previous != VK_NULL_HANDLE);
+-        command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+-                                       static_cast<u32>(upload_regions_.size()),
+-                                       upload_regions_.data());
++        if (!hoist_to_pre_rp ||
++            !command_buffer.AppendHoistedBufferCopy(upload_buffer_previous, buffer_,
++                                                    static_cast<u32>(upload_regions_.size()),
++                                                    upload_regions_.data())) {
++          command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
++                                         static_cast<u32>(upload_regions_.size()),
++                                         upload_regions_.data());
++        }
+         upload_regions_.clear();
+       }
+       upload_buffer_previous = upload_buffer;
+diff --git a/src/gpu/xenos/vulkan/shared_memory.h b/src/gpu/xenos/vulkan/shared_memory.h
+index e3040bfa..9bdcc31f 100644
+--- a/src/gpu/xenos/vulkan/shared_memory.h
++++ b/src/gpu/xenos/vulkan/shared_memory.h
+@@ -52,11 +52,13 @@ class VulkanSharedMemory : public SharedMemory {
+   void Use(Usage usage, std::pair<u32, u32> written_range = {});
+ 
+   VkBuffer GetBuffer() const { return buffer_; }
++  void OnRenderPassEnded();
+ 
+  protected:
+   bool AllocateSparseHostGPUMemoryRange(u32 offset_allocations, u32 length_allocations) override;
+ 
+   bool UploadRanges(const std::vector<std::pair<u32, u32>>& upload_page_ranges) override;
++  void OnRangesRequested(const std::vector<std::pair<u32, u32>>& merged_ranges) override;
+ 
+  private:
+   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
+@@ -75,6 +77,8 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   std::unique_ptr<gpu::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
+   std::vector<VkBufferCopy> upload_regions_;
++  std::vector<u32> rp_read_gen_;
++  u32 current_rp_gen_ = 1;
+ };
+ 
+ }  // namespace rex::gpu::vulkan
+diff --git a/src/gpu/xenos/vulkan/texture_cache.cpp b/src/gpu/xenos/vulkan/texture_cache.cpp
+index c1c61d10..9aedf078 100644
+--- a/src/gpu/xenos/vulkan/texture_cache.cpp
++++ b/src/gpu/xenos/vulkan/texture_cache.cpp
+@@ -1,3 +1,7 @@
++#if defined(__ANDROID__)
++#include <atomic>
++std::atomic<uint64_t> g_rex_vk_texloads{0};
++#endif
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -29,6 +33,16 @@
+ #include "gpu/xenos/host/vulkan/ui_sampler.h"
+ #include "gpu/xenos/host/vulkan/vulkan_objects.h"
+ 
++#if defined(__ANDROID__)
++// REX_POP_TEX_DUMPER
++#include <cstdint>
++namespace rex_pop_tex {
++inline void MaybeDumpOrOverride2D(rex::gpu::SharedMemory&, uint32_t, uint32_t, uint32_t,
++                                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
++                                  uint32_t, uint32_t) {}
++}  // namespace rex_pop_tex
++#endif
++
+ namespace rex::gpu::vulkan {
+ 
+ namespace shaders {
+@@ -1200,6 +1214,17 @@ bool VulkanTextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture,
+   u32 block_width = guest_format_info->block_width;
+   u32 block_height = guest_format_info->block_height;
+   u32 bytes_per_block = guest_format_info->GetBytesPerBlock();
++#if defined(__ANDROID__)
++  if (load_base && !is_3d && array_size == 1) {
++    rex_pop_tex::MaybeDumpOrOverride2D(
++        GetSharedMemory(), static_cast<uint32_t>(texture_key.base_page) << 12,
++        width, height, static_cast<uint32_t>(guest_format),
++        static_cast<uint32_t>(texture_key.tiled),
++        static_cast<uint32_t>(texture_key.endianness),
++        static_cast<uint32_t>(texture_key.mip_max_level),
++        block_width, block_height, bytes_per_block);
++  }
++#endif
+   u32 level_first = load_base ? 0 : 1;
+   u32 level_last = load_mips ? texture_key.mip_max_level : 0;
+   REX_ASSERT(level_first <= level_last);
+@@ -1632,6 +1657,9 @@ bool VulkanTextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture,
+         texture_dst_access_mask, texture_old_layout, texture_new_layout);
+   }
+   command_processor_.SubmitBarriers(true);
++#if defined(__ANDROID__)
++  g_rex_vk_texloads.fetch_add(1, std::memory_order_relaxed);
++#endif
+   VkBufferImageCopy* copy_regions = command_buffer.CmdVkCopyBufferToImageEmplace(
+       scratch_buffer, vulkan_texture.GetImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+       level_last - level_first + 1);
+diff --git a/src/kernel/kernel_thread.cpp b/src/kernel/kernel_thread.cpp
+index 3c80d445..7bc572ee 100644
+--- a/src/kernel/kernel_thread.cpp
++++ b/src/kernel/kernel_thread.cpp
+@@ -1067,14 +1067,17 @@ X_STATUS KernelThread::Delay([[maybe_unused]] u32 processor_mode, u32 alertable,
+         return X_STATUS_USER_APC;
+     }
+   } else {
++    // REX_ANDROID_DELAY_COOL
+     if (duration == std::chrono::microseconds::zero()) {
+       if (priority_ <= rex::platform::ThreadPriority::kBelowNormal) {
+-        rex::platform::SleepFor(std::chrono::microseconds(100));
++        rex::platform::SleepFor(std::chrono::microseconds(250));
+       } else {
+         rex::platform::MaybeYield();
+       }
+     } else {
++#if !defined(__ANDROID__)
+       rex::platform::MaybeYield();
++#endif
+       ObserveDelay(duration, false);
+       SleepFor(duration);
+     }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index f131dd6c..1f96a8cb 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -1,3 +1,8 @@
++#if defined(__ANDROID__)
++// REX_ANDROID_YIELD_BACKOFF
++#include <chrono>
++#include <thread>
++#endif
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -349,7 +354,29 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, MappedU64 in
+     return X_STATUS_USER_APC;
+   }
+ 
+-  X_STATUS result = thread->Delay(processor_mode, alertable, *interval_ptr);
++  const u64 rex_delay_iv = *interval_ptr;
++#if defined(__ANDROID__)
++  if (rex_delay_iv == 0u) {
++    using SteadyClk = std::chrono::steady_clock;
++    thread_local SteadyClk::time_point rex_delay0_last{};
++    thread_local u32 rex_delay0_streak = 0u;
++    const auto rex_now = SteadyClk::now();
++    if (rex_delay0_streak > 0u &&
++        std::chrono::duration_cast<std::chrono::microseconds>(rex_now - rex_delay0_last).count() < 250) {
++      ++rex_delay0_streak;
++    } else {
++      rex_delay0_streak = 1u;
++    }
++    rex_delay0_last = rex_now;
++    if (rex_delay0_streak > 3u) {
++      KernelThread::CheckStop();
++      std::this_thread::sleep_for(
++          std::chrono::microseconds(rex_delay0_streak <= 12u ? 300 : 1000));
++      return X_STATUS_SUCCESS;
++    }
++  }
++#endif
++  X_STATUS result = thread->Delay(processor_mode, alertable, rex_delay_iv);
+ 
+   if (alertable && result == X_STATUS_USER_APC) {
+     thread->DeliverAPCs();
+@@ -361,7 +388,30 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, MappedU64 in
+ u32 NtYieldExecution_entry() {
+   KernelThread::CheckStop();
+   KernelThread::WriteKernelTime();
++#if defined(__ANDROID__)
++  {
++    using SteadyClk = std::chrono::steady_clock;
++    thread_local SteadyClk::time_point rex_last_yield{};
++    thread_local u32 rex_spin_streak = 0u;
++    const auto rex_now = SteadyClk::now();
++    if (rex_spin_streak > 0u &&
++        std::chrono::duration_cast<std::chrono::microseconds>(rex_now - rex_last_yield).count() < 250) {
++      ++rex_spin_streak;
++    } else {
++      rex_spin_streak = 1u;
++    }
++    rex_last_yield = rex_now;
++    if (rex_spin_streak <= 3u) {
++      rex::platform::MaybeYield();
++    } else if (rex_spin_streak <= 12u) {
++      std::this_thread::sleep_for(std::chrono::microseconds(250));
++    } else {
++      std::this_thread::sleep_for(std::chrono::microseconds(1000));
++    }
++  }
++#else
+   rex::platform::MaybeYield();
++#endif
+   return X_STATUS_SUCCESS;
+ }
+ 
+@@ -898,6 +948,32 @@ u32 KeCancelTimer_entry(GuestPtrT<X_KTIMER> timer) {
+   return was_set ? 1 : 0;
+ }
+ 
++#if defined(__ANDROID__)
++// REX_ANDROID_WAIT0_BACKOFF
++namespace {
++inline void RexBackoffZeroTimeoutPoll(bool is_zero_timeout_miss) {
++  using SteadyClk = std::chrono::steady_clock;
++  thread_local SteadyClk::time_point last_miss{};
++  thread_local u32 miss_streak = 0u;
++  if (!is_zero_timeout_miss) {
++    miss_streak = 0u;
++    return;
++  }
++  const auto now = SteadyClk::now();
++  if (miss_streak > 0u &&
++      std::chrono::duration_cast<std::chrono::microseconds>(now - last_miss).count() < 300) {
++    ++miss_streak;
++  } else {
++    miss_streak = 1u;
++  }
++  last_miss = now;
++  if (miss_streak > 3u) {
++    std::this_thread::sleep_for(std::chrono::microseconds(miss_streak <= 12u ? 300 : 1000));
++  }
++}
++}  // namespace
++#endif
++
+ u32 KeWaitForSingleObject(u32 object_address, u32 wait_reason, u32 processor_mode, u32 alertable,
+                           u64* timeout_ptr) {
+   ObjectPin object = kernel::GetCurrent().GetObjectTable().ResolveObject(object_address, -1);
+@@ -913,6 +989,10 @@ u32 KeWaitForSingleObject(u32 object_address, u32 wait_reason, u32 processor_mod
+   if (alertable && result == X_STATUS_USER_APC) {
+     KernelThread::GetCallingThread()->DeliverAPCs();
+   }
++#if defined(__ANDROID__)
++  RexBackoffZeroTimeoutPoll(timeout_ptr != nullptr && *timeout_ptr == 0u &&
++                            result == static_cast<X_STATUS>(0x00000102u));
++#endif
+ 
+   return result;
+ }
+@@ -937,6 +1017,10 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+   if (alertable && result == X_STATUS_USER_APC) {
+     KernelThread::GetCallingThread()->DeliverAPCs();
+   }
++#if defined(__ANDROID__)
++  RexBackoffZeroTimeoutPoll(timeout_ptr && timeout == 0u &&
++                            result == static_cast<X_STATUS>(0x00000102u));
++#endif
+ 
+   return result;
+ }
+diff --git a/src/ui/sdl3/sdl3_ui_driver.cpp b/src/ui/sdl3/sdl3_ui_driver.cpp
+index 035393bf..ea8a3c3f 100644
+--- a/src/ui/sdl3/sdl3_ui_driver.cpp
++++ b/src/ui/sdl3/sdl3_ui_driver.cpp
+@@ -1,3 +1,5 @@
++#include <chrono>
++#include <thread>
+ #include "ui/sdl3/sdl3_ui_driver.h"
+ 
+ #include <array>
+@@ -695,7 +697,12 @@ Result<NativeWindow> SDL3UIDriver::GetNativeWindow() const {
+   NativeWindow result;
+   result.sdl = s.window;
+   const SDL_PropertiesID props = SDL_GetWindowProperties(s.window);
+-  if (void* hwnd = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr)) {
++  if (void* android_window =
++          SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr)) {
++    result.type = NativeWindow::Type::kAndroid;
++    result.window = android_window;
++    return result;
++  }  if (void* hwnd = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr)) {
+     result.type = NativeWindow::Type::kWin32;
+     result.window = hwnd;
+     return result;
+@@ -737,8 +744,18 @@ bool SDL3UIDriver::WaitEvents(IUIEventListener& listener, u32 timeout_ms) {
+   State& s = *state_;
+   s.listener = &listener;
+   SDL_Event event;
++#if defined(__ANDROID__)
++  // REX_ANDROID_POLL_SLEEP: SDL3 Android WaitEventTimeout busy-spins clock_gettime
++  bool got = SDL_PollEvent(&event);
++  if (!got && timeout_ms > 0) {
++    const u32 sleep_ms = timeout_ms > 12 ? 12 : timeout_ms;
++    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
++    got = SDL_PollEvent(&event);
++  }
++#else
+   const bool got = timeout_ms > 0 ? SDL_WaitEventTimeout(&event, static_cast<Sint32>(timeout_ms))
+                                   : SDL_PollEvent(&event);
++#endif
+   if (got) {
+     s.Process(event);
+     while (SDL_PollEvent(&event)) {

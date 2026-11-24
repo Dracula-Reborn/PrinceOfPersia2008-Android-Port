@@ -1,0 +1,31 @@
+# Copyrighted game assets (NEVER commit)
+*.forge
+*.xex
+*.bik
+*.bin
+scimitar.ini
+Videos/
+media/
+
+# Android build outputs & signing keys
+*.apk
+*.aab
+*.dex
+*.class
+*.keystore
+*.jks
+classes/
+dex/
+stage/
+res_compiled/
+
+# Native binaries & build caches
+*.so
+*.o
+*.a
+*.obj
+build/
+out/
+cache/
+logs/
+user/
