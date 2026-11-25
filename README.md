@@ -3,7 +3,7 @@
 Android ARM64 port wrapper, custom touch controls, and Vulkan/Adreno performance patches for **Prince of Persia (2008)** built on top of the ReXGlue static recompilation runtime.
 
 ## Features
-- **Custom Android Launcher & Activity** (ndroid/java/com/rexglue/pop/) with FPS cap, VSync, Anisotropic Filtering, 2x MSAA, GPU driver selector, and built-in game folder importer.
+- **Custom Android Launcher & Activity** (Android/java/com/rexglue/pop/) with FPS cap, VSync, Anisotropic Filtering, 2x MSAA, GPU driver selector, and built-in game folder importer.
 - **Custom Touch Overlay** (TouchOverlayView.java) with medallion controls and enlarged Xbox key badges (A, B, X, Y, LB, RB, LT, RT, BACK, START).
 - **Vulkan & Adreno Optimizations** (exglue-patches/) including 2x MSAA handling, Adreno UBWC hints, and rendering filters.
 - **Package ID / Data Directory:** com.princeofpersia.files (/sdcard/Android/data/com.princeofpersia.files/files).
